@@ -26,7 +26,7 @@ async def get_conn_data(session, conn_id):
     return res.scalar_one_or_none()
 
 async def download_media_logic(bot: Bot, message: Message):
-    """Скачивает медиа СТРОГО из переданного сообщения"""
+    """Скачивает медиа СТРОГО из переданного сообщения (без заглядывания в реплаи)"""
     file_id = None
     m_type = None
     
@@ -54,6 +54,7 @@ async def download_media_logic(bot: Bot, message: Message):
 
 @router.business_message()
 async def on_business_msg(message: Message, bot: Bot):
+    """Обработка ТОЛЬКО новых сообщений"""
     conn_id = message.business_connection_id
     msg_id = message.message_id
     
@@ -68,6 +69,7 @@ async def on_business_msg(message: Message, bot: Bot):
         f_p, m_t, f_id = await download_media_logic(bot, message)
         text = (message.text or message.caption or "").strip()
         
+        # ЖЕСТКИЙ ДЕТЕКТОР: только Fg префикс или системный флаг времени
         is_sd = False
         if f_id and f_id.startswith("Fg"): 
             is_sd = True
@@ -108,19 +110,16 @@ async def on_business_msg(message: Message, bot: Bot):
             
             reply_obj = message.reply_to_message
             reply_to_id = reply_obj.message_id
-            logger.info(f"[REPLY] Поиск оригинала для {reply_to_id}...")
+            logger.info(f"[REPLY] Владелец ответил на {reply_to_id}. Проверка на исчезающее...")
 
-            res_orig = await session.execute(
-                select(MsgLog).where(
-                    and_(
-                        MsgLog.owner_id == owner_id,
-                        MsgLog.chat_id == message.chat.id,
-                        or_(MsgLog.message_id == reply_to_id, MsgLog.message_id == reply_to_id - 1),
-                        MsgLog.message_id != msg_id,
-                        MsgLog.file_path != None
-                    )
-                ).order_by(desc(MsgLog.id))
-            )
+            # А) Ищем в базе
+            res_orig = await session.execute(select(MsgLog).where(and_(
+                MsgLog.owner_id == owner_id, 
+                MsgLog.chat_id == message.chat.id, 
+                or_(MsgLog.message_id == reply_to_id, MsgLog.message_id == reply_to_id - 1),
+                MsgLog.message_id != msg_id,
+                MsgLog.file_path != None
+            )).order_by(desc(MsgLog.id)))
             orig = res_orig.scalars().first()
 
             final_path, final_type, final_id = None, None, None
@@ -130,29 +129,14 @@ async def on_business_msg(message: Message, bot: Bot):
                 final_path, final_type = orig.file_path, orig.media_type
                 final_id = os.path.basename(final_path).split('.')[0] if final_path else ""
                 is_actually_sd = orig.is_self_destruct
+                logger.info(f"[FIND] В БД: ID {orig.message_id}, SD_Flag: {is_actually_sd}, Prefix: {final_id[:2]}")
             else:
-                # Если в базе нет, качаем прямо из объекта ответа
+                # Б) Если в базе нет, пробуем захват из объекта ответа
                 final_path, final_type, final_id = await download_media_logic(bot, reply_obj)
                 if final_id and final_id.startswith("Fg"): is_actually_sd = True
-                
-                # ИСПРАВЛЕНИЕ: СОХРАНЯЕМ В БАЗУ ТО, ЧТО ВЫТАЩИЛИ ИЗ ОТВЕТА
-                if final_path and final_path != "error":
-                    try:
-                        missing_log = MsgLog(
-                            owner_id=owner_id, connection_id=conn_id, message_id=reply_to_id,
-                            chat_id=message.chat.id, from_id=reply_obj.from_user.id,
-                            from_name=reply_obj.from_user.full_name, from_username=reply_obj.from_user.username,
-                            text=(reply_obj.text or reply_obj.caption or "").strip(), 
-                            file_path=final_path, media_type=final_type, 
-                            reply_to_id=None, is_self_destruct=is_actually_sd
-                        )
-                        session.add(missing_log)
-                        await session.commit()
-                        logger.info(f"[DB RECOVER] Восстановлено в базу из ответа: {reply_to_id}")
-                    except Exception as e:
-                        await session.rollback()
-                        logger.error(f"[DB RECOVER ERROR] {e}")
+                logger.info(f"[FIND] В БД пусто. Захват из ответа: Prefix {final_id[:2] if final_id else 'None'}")
 
+            # В) ОТПРАВКА (Строго только если SD)
             if final_id and final_id.startswith("Ag"):
                 logger.info(f"[SKIP] Обычное фото (Ag). Отмена.")
                 return
@@ -166,25 +150,29 @@ async def on_business_msg(message: Message, bot: Bot):
                     if acc.attempts > 0:
                         acc.attempts -= 1; await session.commit()
                     elif acc.attempts != 0:
-                        return await bot.send_message(owner_id, "❌ У вас закончились попытки. Пригласите друзей: /ref")
+                        return await bot.send_message(owner_id, "❌ У вас закончились попытки.")
 
                 try:
                     f = FSInputFile(final_path)
                     status = "Premium ⭐" if is_paid else f"Осталось попыток: {acc.attempts if acc.attempts > 0 else '∞'}"
                     cap = f"🔥 <b>Восстановлено исчезающее медиа:</b>\nОт: {html.escape(reply_obj.from_user.full_name or '?')}\n\n{status}"
-                    
                     if final_type == "photo": await bot.send_photo(owner_id, f, caption=cap, parse_mode="HTML")
                     elif final_type == "video": await bot.send_video(owner_id, f, caption=cap, parse_mode="HTML")
-                    logger.info(f"[RESTORE SUCCESS] Отправлено владельцу {owner_id}")
+                    logger.info(f"[SEND SUCCESS] Отправлено владельцу {owner_id}")
                 except Exception as e:
-                    logger.error(f"[RESTORE ERROR] {e}")
+                    logger.error(f"[SEND ERROR] {e}")
+            else:
+                logger.info(f"[SKIP] Это обычное медиа (Ag) или файл не найден. Отмена отправки.")
 
 @router.edited_business_message()
 async def on_edit(message: Message, bot: Bot):
+    """Обработка ТОЛЬКО измененных сообщений"""
     async with Session() as session:
         conn_data = await get_conn_data(session, message.business_connection_id)
         if not conn_data: return
         owner_id = conn_data.user_id
+        
+        # Игнорируем правки самого владельца
         if message.from_user.id == owner_id: return
 
         acc = await session.get(UserAccount, owner_id)
@@ -216,21 +204,17 @@ async def on_edit(message: Message, bot: Bot):
 
 @router.deleted_business_messages()
 async def on_delete(event: BusinessMessagesDeleted, bot: Bot):
+    """Обработка ТОЛЬКО удаленных сообщений"""
     async with Session() as session:
-        conn_data = await get_conn_data(session, event.business_connection_id)
-        if not conn_data: return
-        owner_id = conn_data.user_id
+        res_c = await session.execute(select(Conn).where(Conn.id == event.business_connection_id))
+        c = res_c.scalar_one_or_none()
+        if not c: return
+        owner_id = c.user_id
         acc = await session.get(UserAccount, owner_id)
         if not acc or not acc.notify_deletes: return
-        
         for m_id in event.message_ids:
-            res = await session.execute(select(MsgLog).where(and_(
-                MsgLog.owner_id == owner_id, 
-                MsgLog.connection_id == event.business_connection_id, 
-                or_(MsgLog.message_id == m_id, MsgLog.message_id == m_id - 1)
-            )).order_by(desc(MsgLog.id)))
+            res = await session.execute(select(MsgLog).where(and_(MsgLog.owner_id == owner_id, MsgLog.connection_id == event.business_connection_id, or_(MsgLog.message_id == m_id, MsgLog.message_id == m_id - 1))).order_by(desc(MsgLog.id)))
             msg = res.scalars().first()
-            
             if msg and msg.from_id != owner_id:
                 caption = f"🗑 <b>Удалено от {html.escape(msg.from_name or '?')}:</b>\n<blockquote>{html.escape(msg.text or '')}</blockquote>"
                 try:
