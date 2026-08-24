@@ -25,7 +25,7 @@ class MsgLog(Base):
 class UserAccount(Base):
     __tablename__ = "user_accounts"
     user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    attempts: Mapped[int] = mapped_column(default=10) # ИЗМЕНЕНО НА 10
+    attempts: Mapped[int] = mapped_column(default=10)
     referrer_id: Mapped[int] = mapped_column(BigInteger, nullable=True)
     notify_edits: Mapped[bool] = mapped_column(default=True)
     notify_deletes: Mapped[bool] = mapped_column(default=True)
