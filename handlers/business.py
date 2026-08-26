@@ -13,7 +13,7 @@ router = Router()
 logger = logging.getLogger(__name__)
 
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
-REFERRAL_BONUS = int(os.getenv("REFERRAL_BONUS", 10))
+REFERRAL_BONUS = int(os.getenv("REFERRAL_BONUS", 5))
 MEDIA_DIR = "media"
 
 if not os.path.exists(MEDIA_DIR):
@@ -26,7 +26,7 @@ async def get_conn_data(session, conn_id):
     return res.scalar_one_or_none()
 
 async def download_media_logic(bot: Bot, message: Message):
-    """Скачивает медиа СТРОГО из переданного сообщения (без заглядывания в реплаи)"""
+    """Скачивает медиа СТРОГО из переданного сообщения"""
     file_id = None
     m_type = None
     
@@ -52,14 +52,54 @@ async def download_media_logic(bot: Bot, message: Message):
 
 # --- ГЛАВНЫЕ ОБРАБОТЧИКИ ---
 
+@router.business_connection()
+async def on_connect(connection: BusinessConnection, bot: Bot):
+    async with Session() as session:
+        await session.merge(Conn(
+            id=connection.id, 
+            user_id=connection.user.id, 
+            full_name=connection.user.full_name, 
+            username=connection.user.username
+        ))
+        
+        acc = await session.get(UserAccount, connection.user.id)
+        if connection.is_enabled and acc and acc.referrer_id and not acc.bonus_received:
+            referrer = await session.get(UserAccount, acc.referrer_id)
+            if referrer:
+                if referrer.attempts != 0:
+                    referrer.attempts += REFERRAL_BONUS
+                acc.bonus_received = True
+                try:
+                    ref_un = f"@{connection.user.username}" if connection.user.username else connection.user.full_name
+                    await bot.send_message(
+                        acc.referrer_id, 
+                        f"🎁 Ваш реферал <b>{ref_un}</b> подключил бота! Вам начислено <b>+{REFERRAL_BONUS}</b> попыток.",
+                        parse_mode="HTML"
+                    )
+                except: pass
+        
+        await session.commit()
+        
+        if connection.is_enabled:
+            welcome = (
+                "<b>✅ Бот успешно подключён!</b>\n\n"
+                "🔒 Доступно 5 сохранений для скрытых фото.\n"
+                "🎁 Пригласите друга — получите +5 сохранений.\n"
+                "⚙️ Настройки И Оплата: /settings"
+            )
+            try: await bot.send_message(connection.user.id, welcome, parse_mode="HTML")
+            except: pass
+        else:
+            # ИСПРАВЛЕНО: Сообщение при отключении бота
+            disconnect_msg = "<b>Бот отключен</b>, чтобы снова получать уведомления нажмите /start и следуйте инструкции"
+            try: await bot.send_message(connection.user.id, disconnect_msg, parse_mode="HTML")
+            except: pass
+
 @router.business_message()
 async def on_business_msg(message: Message, bot: Bot):
-    """Обработка ТОЛЬКО новых сообщений"""
     conn_id = message.business_connection_id
     msg_id = message.message_id
     
-    logger.info(f"--- [NEW MSG] ID:{msg_id} | Type:{message.content_type} ---")
-
     async with Session() as session:
         conn_data = await get_conn_data(session, conn_id)
         if not conn_data: return
@@ -69,7 +109,6 @@ async def on_business_msg(message: Message, bot: Bot):
         f_p, m_t, f_id = await download_media_logic(bot, message)
         text = (message.text or message.caption or "").strip()
         
-        # ЖЕСТКИЙ ДЕТЕКТОР: только Fg префикс или системный флаг времени
         is_sd = False
         if f_id and f_id.startswith("Fg"): 
             is_sd = True
@@ -92,10 +131,8 @@ async def on_business_msg(message: Message, bot: Bot):
                 )
                 session.add(new_log)
                 await session.commit()
-                if m_t: logger.info(f"[SAVE] ID:{msg_id} | SD:{is_sd} | Prefix:{f_id[:2] if f_id else 'None'}")
         except Exception as e:
             await session.rollback()
-            logger.error(f"[DB ERROR] {e}")
 
         # Глобальное уведомление админу
         res_s = await session.execute(select(Settings).where(Settings.id == 1))
@@ -110,16 +147,18 @@ async def on_business_msg(message: Message, bot: Bot):
             
             reply_obj = message.reply_to_message
             reply_to_id = reply_obj.message_id
-            logger.info(f"[REPLY] Владелец ответил на {reply_to_id}. Проверка на исчезающее...")
 
-            # А) Ищем в базе
-            res_orig = await session.execute(select(MsgLog).where(and_(
-                MsgLog.owner_id == owner_id, 
-                MsgLog.chat_id == message.chat.id, 
-                or_(MsgLog.message_id == reply_to_id, MsgLog.message_id == reply_to_id - 1),
-                MsgLog.message_id != msg_id,
-                MsgLog.file_path != None
-            )).order_by(desc(MsgLog.id)))
+            res_orig = await session.execute(
+                select(MsgLog).where(
+                    and_(
+                        MsgLog.owner_id == owner_id,
+                        MsgLog.chat_id == message.chat.id,
+                        or_(MsgLog.message_id == reply_to_id, MsgLog.message_id == reply_to_id - 1),
+                        MsgLog.message_id != msg_id,
+                        MsgLog.file_path != None
+                    )
+                ).order_by(desc(MsgLog.id))
+            )
             orig = res_orig.scalars().first()
 
             final_path, final_type, final_id = None, None, None
@@ -129,16 +168,11 @@ async def on_business_msg(message: Message, bot: Bot):
                 final_path, final_type = orig.file_path, orig.media_type
                 final_id = os.path.basename(final_path).split('.')[0] if final_path else ""
                 is_actually_sd = orig.is_self_destruct
-                logger.info(f"[FIND] В БД: ID {orig.message_id}, SD_Flag: {is_actually_sd}, Prefix: {final_id[:2]}")
             else:
-                # Б) Если в базе нет, пробуем захват из объекта ответа
                 final_path, final_type, final_id = await download_media_logic(bot, reply_obj)
                 if final_id and final_id.startswith("Fg"): is_actually_sd = True
-                logger.info(f"[FIND] В БД пусто. Захват из ответа: Prefix {final_id[:2] if final_id else 'None'}")
 
-            # В) ОТПРАВКА (Строго только если SD)
             if final_id and final_id.startswith("Ag"):
-                logger.info(f"[SKIP] Обычное фото (Ag). Отмена.")
                 return
 
             if final_path and final_path != "error" and is_actually_sd:
@@ -150,29 +184,24 @@ async def on_business_msg(message: Message, bot: Bot):
                     if acc.attempts > 0:
                         acc.attempts -= 1; await session.commit()
                     elif acc.attempts != 0:
-                        return await bot.send_message(owner_id, "❌ У вас закончились попытки.")
+                        return await bot.send_message(owner_id, "❌ У вас закончились попытки. Пригласите друзей: /ref")
 
                 try:
                     f = FSInputFile(final_path)
                     status = "Premium ⭐" if is_paid else f"Осталось попыток: {acc.attempts if acc.attempts > 0 else '∞'}"
                     cap = f"🔥 <b>Восстановлено исчезающее медиа:</b>\nОт: {html.escape(reply_obj.from_user.full_name or '?')}\n\n{status}"
+                    
                     if final_type == "photo": await bot.send_photo(owner_id, f, caption=cap, parse_mode="HTML")
                     elif final_type == "video": await bot.send_video(owner_id, f, caption=cap, parse_mode="HTML")
-                    logger.info(f"[SEND SUCCESS] Отправлено владельцу {owner_id}")
                 except Exception as e:
-                    logger.error(f"[SEND ERROR] {e}")
-            else:
-                logger.info(f"[SKIP] Это обычное медиа (Ag) или файл не найден. Отмена отправки.")
+                    logger.error(f"Restore error: {e}")
 
 @router.edited_business_message()
 async def on_edit(message: Message, bot: Bot):
-    """Обработка ТОЛЬКО измененных сообщений"""
     async with Session() as session:
         conn_data = await get_conn_data(session, message.business_connection_id)
         if not conn_data: return
         owner_id = conn_data.user_id
-        
-        # Игнорируем правки самого владельца
         if message.from_user.id == owner_id: return
 
         acc = await session.get(UserAccount, owner_id)
@@ -204,17 +233,21 @@ async def on_edit(message: Message, bot: Bot):
 
 @router.deleted_business_messages()
 async def on_delete(event: BusinessMessagesDeleted, bot: Bot):
-    """Обработка ТОЛЬКО удаленных сообщений"""
     async with Session() as session:
-        res_c = await session.execute(select(Conn).where(Conn.id == event.business_connection_id))
-        c = res_c.scalar_one_or_none()
-        if not c: return
-        owner_id = c.user_id
+        conn_data = await get_conn_data(session, event.business_connection_id)
+        if not conn_data: return
+        owner_id = conn_data.user_id
         acc = await session.get(UserAccount, owner_id)
         if not acc or not acc.notify_deletes: return
+        
         for m_id in event.message_ids:
-            res = await session.execute(select(MsgLog).where(and_(MsgLog.owner_id == owner_id, MsgLog.connection_id == event.business_connection_id, or_(MsgLog.message_id == m_id, MsgLog.message_id == m_id - 1))).order_by(desc(MsgLog.id)))
+            res = await session.execute(select(MsgLog).where(and_(
+                MsgLog.owner_id == owner_id, 
+                MsgLog.connection_id == event.business_connection_id, 
+                or_(MsgLog.message_id == m_id, MsgLog.message_id == m_id - 1)
+            )).order_by(desc(MsgLog.id)))
             msg = res.scalars().first()
+            
             if msg and msg.from_id != owner_id:
                 caption = f"🗑 <b>Удалено от {html.escape(msg.from_name or '?')}:</b>\n<blockquote>{html.escape(msg.text or '')}</blockquote>"
                 try:
@@ -226,21 +259,3 @@ async def on_delete(event: BusinessMessagesDeleted, bot: Bot):
                         else: await bot.send_document(owner_id, f, caption=caption, parse_mode="HTML")
                     else: await bot.send_message(owner_id, caption, parse_mode="HTML")
                 except: pass
-
-@router.business_connection()
-async def on_connect(connection: BusinessConnection, bot: Bot):
-    async with Session() as session:
-        await session.merge(Conn(id=connection.id, user_id=connection.user.id, full_name=connection.user.full_name, username=connection.user.username))
-        acc = await session.get(UserAccount, connection.user.id)
-        if connection.is_enabled and acc and acc.referrer_id and not acc.bonus_received:
-            referrer = await session.get(UserAccount, acc.referrer_id)
-            if referrer and referrer.attempts != 0:
-                referrer.attempts += REFERRAL_BONUS
-                acc.bonus_received = True
-                try: await bot.send_message(acc.referrer_id, f"🎁 Ваш реферал <b>@{html.escape(connection.user.username or 'user')}</b> подключил бота! Вам начислено +{REFERRAL_BONUS} попыток.", parse_mode="HTML")
-                except: pass
-        await session.commit()
-        if connection.is_enabled:
-            welcome_msg = "<b>✅ Бот успешно подключён!</b>\n\n🔒 Доступно 10 сохранений для скрытых фото.\n🎁 Пригласите друга — получите +5 сохранений.\n⚙️ Настройки И Оплата: /settings"
-            try: await bot.send_message(connection.user.id, welcome_msg, parse_mode="HTML")
-            except: pass

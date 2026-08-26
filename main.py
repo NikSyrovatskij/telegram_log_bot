@@ -49,6 +49,7 @@ async def send_daily_exports():
         res = await session.execute(select(UserAccount).where(UserAccount.daily_export == True))
         accounts = res.scalars().all()
         admin_id = int(os.getenv("ADMIN_ID"))
+        
         for acc in accounts:
             path = f"daily_{acc.user_id}.csv"
             yesterday = datetime.now() - timedelta(days=1)
@@ -56,16 +57,19 @@ async def send_daily_exports():
             logs_res = await session.execute(stmt)
             rows = logs_res.scalars().all()
             if not rows: continue
+            
             seen = set(); unique_rows = []
             for r in rows:
                 key = (r.message_id, r.text)
                 if key not in seen: seen.add(key); unique_rows.append(r)
+
             with open(path, "w", encoding="utf-8-sig", newline='') as f:
                 w = csv.writer(f); w.writerow(["Дата (МСК)", "От кого", "Текст", "Файл"])
                 for r in unique_rows:
                     time_msk = r.created_at + timedelta(hours=3)
                     sender = f"@{r.from_username} ({r.from_name})" if r.from_username else f"({r.from_name})"
                     w.writerow([time_msk.strftime("%Y-%m-%d %H:%M"), sender, r.text, r.file_path])
+            
             c_res = await session.execute(select(Conn).where(Conn.user_id == acc.user_id))
             c = c_res.scalars().first()
             u_info = f"@{c.username}" if c and c.username else f"ID:{acc.user_id}"
