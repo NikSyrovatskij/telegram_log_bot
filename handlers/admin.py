@@ -30,7 +30,7 @@ START_ATTEMPTS = int(os.getenv("START_ATTEMPTS", 10))
 
 Configuration.account_id = os.getenv("YOOKASSA_SHOP_ID")
 Configuration.secret_key = os.getenv("YOOKASSA_SECRET_KEY")
-PRICE_30_DAYS = int(os.getenv("PRICE_30_DAYS", 100))
+PRICE_30_DAYS = int(os.getenv("PRICE_30_DAYS", 10))
 PRICE_60_DAYS = int(os.getenv("PRICE_60_DAYS", 170))
 
 class AdminStates(StatesGroup):
