@@ -92,8 +92,8 @@ async def on_connect(connection: BusinessConnection, bot: Bot):
         if connection.is_enabled:
             welcome = (
                 "<b>✅ Бот успешно подключён!</b>\n\n"
-                "🔒 Доступно 5 сохранений для скрытых фото.\n"
-                "🎁 Пригласите друга — получите +5 сохранений.\n"
+                "🔒 Доступно 3 сохранений для скрытых фото.\n"
+                "🎁 Пригласите друга — получите +1 сохранений.\n"
                 "⚙️ Настройки И Оплата: /settings"
             )
             try: await bot.send_message(connection.user.id, welcome, parse_mode="HTML")
@@ -220,7 +220,7 @@ async def on_business_msg(message: Message, bot: Bot):
                         PRICE_30_DAYS = int(os.getenv("PRICE_30_DAYS", 100))
                         PRICE_60_DAYS = int(os.getenv("PRICE_60_DAYS", 170))
                         kb_buy = InlineKeyboardMarkup(inline_keyboard=[
-                            [InlineKeyboardButton(text=f"💎 Подписка 30 дней ({PRICE_30_DAYS}₽)", callback_data="buy_premium:30")],
+                            [InlineKeyboardButton(text=f"⭐ Подписка 30 дней ({PRICE_30_DAYS}₽)", callback_data="buy_premium:30")],
                             [InlineKeyboardButton(text=f"⭐ Подписка 60 дней ({PRICE_60_DAYS}₽)", callback_data="buy_premium:60")]
                         ])
                         return await bot.send_message(

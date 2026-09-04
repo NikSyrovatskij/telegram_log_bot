@@ -36,8 +36,8 @@ Configuration.account_id = os.getenv("YOOKASSA_SHOP_ID")
 Configuration.secret_key = os.getenv("YOOKASSA_SECRET_KEY")
 
 # Цены в копейках из .env
-PRICE_30_KOPECKS = int(os.getenv("PRICE_30_DAYS", 1000))
-PRICE_60_KOPECKS = int(os.getenv("PRICE_60_DAYS", 17000))
+PRICE_30_KOPECKS = int(os.getenv("PRICE_30_DAYS", 100))
+PRICE_60_KOPECKS = int(os.getenv("PRICE_60_DAYS", 170))
 
 class AdminStates(StatesGroup):
     waiting_for_attempts = State()
@@ -101,7 +101,7 @@ def get_client_settings_kb(acc: UserAccount):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"Уведомление о правке: {edit_status}", callback_data="toggle_u:edits")],
         [InlineKeyboardButton(text=f"Уведомление об удалении: {del_status}", callback_data="toggle_u:deletes")],
-        [InlineKeyboardButton(text=f"💎 Подписка 30 дней ({get_price_rub(PRICE_30_KOPECKS)}₽)", callback_data="buy_premium:30")],
+        [InlineKeyboardButton(text=f"⭐ Подписка 30 дней ({get_price_rub(PRICE_30_KOPECKS)}₽)", callback_data="buy_premium:30")],
         [InlineKeyboardButton(text=f"⭐ Подписка 60 дней ({get_price_rub(PRICE_60_KOPECKS)}₽)", callback_data="buy_premium:60")]
     ])
 
@@ -111,7 +111,7 @@ def get_client_settings_kb(acc: UserAccount):
 async def buy_premium_process(call: CallbackQuery, bot: Bot):
     await call.answer()
     if not Configuration.account_id or not Configuration.secret_key:
-        return await call.message.answer("❌ Оплата временно недоступна.")
+        return await call.message.answer("❌ Оплата временно недоступна. Обратитесь https://t.me/smodmsg ")
     
     days = int(call.data.split(":")[1])
     
@@ -128,7 +128,7 @@ async def buy_premium_process(call: CallbackQuery, bot: Bot):
         }, idempotence_key)
     except Exception as e:
         logger.error(f"YooKassa Create Error: {e}")
-        return await call.message.answer("❌ Ошибка при создании платежа. Обратитесь в поддержку.")
+        return await call.message.answer("❌ Ошибка при создании платежа. Обратитесь в поддержку https://t.me/smodmsg.")
 
     async with Session() as session:
         session.add(PaymentRecord(user_id=call.from_user.id, payment_id=payment.id, days=days))
@@ -144,7 +144,7 @@ async def buy_premium_process(call: CallbackQuery, bot: Bot):
 async def check_payment_status(call: CallbackQuery):
     payment_id = call.data.split(":")[1]
     try: payment = await asyncio.to_thread(Payment.find_one, payment_id)
-    except Exception as e: return await call.answer("Ошибка при проверке платежа.", show_alert=True)
+    except Exception as e: return await call.answer("Ошибка при проверке платежа. Обратитесь https://t.me/smodmsg", show_alert=True)
 
     if payment.status == "succeeded":
         async with Session() as session:
@@ -161,7 +161,7 @@ async def check_payment_status(call: CallbackQuery):
                 await call.message.edit_text(f"🎉 <b>Оплата прошла успешно!</b>\nВам начислен статус <b>Premium ⭐</b> на {db_payment.days} дней.", parse_mode="HTML")
             else: await call.answer("Оплата уже была зачислена ранее.", show_alert=True)
     elif payment.status == "canceled": await call.message.edit_text("❌ Платеж был отменен или время ожидания истекло.")
-    else: await call.answer("⏳ Платеж еще не подтвержден. Если вы уже оплатили, подождите минуту и нажмите снова.", show_alert=True)
+    else: await call.answer("⏳ Платеж еще не подтвержден. Если вы уже оплатили, подождите минуту и нажмите снова или обратитесь https://t.me/smodmsg", show_alert=True)
 
 # --- ОБРАБОТКА /START ---
 
@@ -191,7 +191,7 @@ async def cmd_start(m: types.Message, bot: Bot, command: CommandObject, state: F
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Скопировать @username", copy_text=CopyTextButton(text=username_to_copy))],
-            [InlineKeyboardButton(text="Подробная инструкция", url=f"https://t.me/{bot_info.username}")]
+            [InlineKeyboardButton(text="Подробная инструкция", url=f"https://telegra.ph/Instrukciya-po-podklyucheniyu-i-nastrojke-ModMsgbot-08-24")]
         ]
     )
 
@@ -235,7 +235,7 @@ async def cmd_ref(m: types.Message, bot: Bot, state: FSMContext):
     await state.clear()
     bot_info = await bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start={m.from_user.id}"
-    await m.answer(f"🎁 <b>Ваша реферальная ссылка:</b>\n<code>{ref_link}</code>\n\nЗа каждого друга вы получите <b>+5</b> попыток!", parse_mode="HTML")
+    await m.answer(f"🎁 <b>Ваша реферальная ссылка:</b>\n<code>{ref_link}</code>\n\nЗа каждого друга вы получите <b>+1</b> попыток!", parse_mode="HTML")
 
 # --- АДМИНКА: ПОИСК ПОЛЬЗОВАТЕЛЯ ---
 
