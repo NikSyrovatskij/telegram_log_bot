@@ -4,6 +4,8 @@ import html
 import logging
 import asyncio
 import uuid
+import time
+import zipfile
 from datetime import timedelta, datetime
 from aiogram import Router, F, types, Bot
 from aiogram.filters import Command, CommandObject
@@ -12,7 +14,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     FSInputFile, ReplyKeyboardMarkup, KeyboardButton, 
     InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery,
-    LabeledPrice, PreCheckoutQuery, CopyTextButton
+    CopyTextButton
 )
 
 from sqlalchemy import select, func, desc, and_, or_
@@ -27,11 +29,15 @@ ADMIN_ID = int(os.getenv("ADMIN_ID"))
 PAGE_SIZE = 10
 START_PHOTO_PATH = "start_photo.jpg"
 START_ATTEMPTS = int(os.getenv("START_ATTEMPTS", 10))
+MEDIA_DIR = "media"
+ARCHIVE_HISTORY_FILE = os.path.join(MEDIA_DIR, ".archived.txt")
 
 Configuration.account_id = os.getenv("YOOKASSA_SHOP_ID")
 Configuration.secret_key = os.getenv("YOOKASSA_SECRET_KEY")
-PRICE_30_DAYS = int(os.getenv("PRICE_30_DAYS", 10))
-PRICE_60_DAYS = int(os.getenv("PRICE_60_DAYS", 170))
+
+# Цены в копейках из .env
+PRICE_30_KOPECKS = int(os.getenv("PRICE_30_DAYS", 1000))
+PRICE_60_KOPECKS = int(os.getenv("PRICE_60_DAYS", 17000))
 
 class AdminStates(StatesGroup):
     waiting_for_attempts = State()
@@ -40,6 +46,9 @@ class AdminStates(StatesGroup):
     waiting_for_search = State()
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+
+def get_price_rub(kopecks):
+    return kopecks // 100
 
 def fmt_user_info(name, username, user_id=None, is_paid=False):
     mark = "⭐" if is_paid else "👤"
@@ -63,7 +72,7 @@ def get_kb():
         [KeyboardButton(text="📈 Статистика"), KeyboardButton(text="🛠 Настройки бота")],
         [KeyboardButton(text="👥 Пользователи"), KeyboardButton(text="🔍 Поиск")],
         [KeyboardButton(text="🔍 Список логов"), KeyboardButton(text="📥 Экспорт всей базы (CSV)")],
-        [KeyboardButton(text="📦 Архив медиа (>1 часа)")]
+        [KeyboardButton(text="📦 Архив медиа")] # Изменили название кнопки
     ], resize_keyboard=True)
 
 def get_admin_settings_kb(global_notify):
@@ -76,7 +85,7 @@ def get_admin_settings_kb(global_notify):
     ])
 
 def get_user_manage_kb(user_id, daily_status, attempts, is_paid):
-    att_text = "Бесконечно" if attempts == 0 or is_paid else f"{attempts} шт."
+    att_text = "Бесконечно ⭐" if is_paid else f"{attempts} шт."
     daily_text = "✅ Авто-экспорт: ВКЛ" if daily_status else "❌ Авто-экспорт: ВЫКЛ"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💬 Список чатов", callback_data=f"owner:{user_id}:0")],
@@ -92,8 +101,8 @@ def get_client_settings_kb(acc: UserAccount):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"Уведомление о правке: {edit_status}", callback_data="toggle_u:edits")],
         [InlineKeyboardButton(text=f"Уведомление об удалении: {del_status}", callback_data="toggle_u:deletes")],
-        [InlineKeyboardButton(text=f"💎 Подписка 30 дней ({PRICE_30_DAYS}₽)", callback_data="buy_premium:30")],
-        [InlineKeyboardButton(text=f"💎 Подписка 60 дней ({PRICE_60_DAYS}₽)", callback_data="buy_premium:60")]
+        [InlineKeyboardButton(text=f"💎 Подписка 30 дней ({get_price_rub(PRICE_30_KOPECKS)}₽)", callback_data="buy_premium:30")],
+        [InlineKeyboardButton(text=f"⭐ Подписка 60 дней ({get_price_rub(PRICE_60_KOPECKS)}₽)", callback_data="buy_premium:60")]
     ])
 
 # --- ОПЛАТА ЮKASSA ---
@@ -105,19 +114,21 @@ async def buy_premium_process(call: CallbackQuery, bot: Bot):
         return await call.message.answer("❌ Оплата временно недоступна.")
     
     days = int(call.data.split(":")[1])
-    price_rub = PRICE_30_DAYS if days == 1 else PRICE_60_DAYS
-    amount_kopecks = price_rub * 100 
+    
+    # ИСПРАВЛЕНО: Правильная проверка дней и расчет цены
+    price_kopecks = PRICE_30_KOPECKS if days == 30 else PRICE_60_KOPECKS
+    price_rub = price_kopecks / 100
     
     idempotence_key = str(uuid.uuid4())
     try:
         payment = await asyncio.to_thread(Payment.create, {
-            "amount": {"value": f"{price_rub}.00", "currency": "RUB"},
+            "amount": {"value": f"{price_rub:.2f}", "currency": "RUB"},
             "confirmation": {"type": "redirect", "return_url": f"https://t.me/{(await bot.get_me()).username}"},
             "capture": True, "description": f"Подписка Premium на {days} дней"
         }, idempotence_key)
     except Exception as e:
         logger.error(f"YooKassa Create Error: {e}")
-        return await call.message.answer("❌ Ошибка при создании платежа. Обратитесь https://t.me/smodmsg")
+        return await call.message.answer("❌ Ошибка при создании платежа. Обратитесь в поддержку.")
 
     async with Session() as session:
         session.add(PaymentRecord(user_id=call.from_user.id, payment_id=payment.id, days=days))
@@ -127,7 +138,7 @@ async def buy_premium_process(call: CallbackQuery, bot: Bot):
         [InlineKeyboardButton(text="💳 Оплатить (СБП / Карта)", url=payment.confirmation.confirmation_url)],
         [InlineKeyboardButton(text="🔄 Проверить оплату", callback_data=f"check_pay:{payment.id}")]
     ])
-    await call.message.answer(f"🧾 <b>Счет на оплату</b>\n\nТариф: <b>Premium на {days} дней</b>\nСумма: <b>{price_rub} руб.</b>\n\nНажмите кнопку ниже для перехода к безопасной оплате ЮKassa. После оплаты нажмите «Проверить оплату».", reply_markup=kb, parse_mode="HTML")
+    await call.message.answer(f"🧾 <b>Счет на оплату</b>\n\nТариф: <b>Premium на {days} дней</b>\nСумма: <b>{int(price_rub)} руб.</b>\n\nНажмите кнопку ниже для перехода к оплате ЮKassa. После оплаты нажмите «Проверить оплату».", reply_markup=kb, parse_mode="HTML")
 
 @router.callback_query(F.data.startswith("check_pay:"))
 async def check_payment_status(call: CallbackQuery):
@@ -149,7 +160,7 @@ async def check_payment_status(call: CallbackQuery):
                 await session.commit()
                 await call.message.edit_text(f"🎉 <b>Оплата прошла успешно!</b>\nВам начислен статус <b>Premium ⭐</b> на {db_payment.days} дней.", parse_mode="HTML")
             else: await call.answer("Оплата уже была зачислена ранее.", show_alert=True)
-    elif payment.status == "canceled": await call.message.edit_text("❌ Платеж был отменен или время ожидания истекло, Обратитесь https://t.me/smodmsg")
+    elif payment.status == "canceled": await call.message.edit_text("❌ Платеж был отменен или время ожидания истекло.")
     else: await call.answer("⏳ Платеж еще не подтвержден. Если вы уже оплатили, подождите минуту и нажмите снова.", show_alert=True)
 
 # --- ОБРАБОТКА /START ---
@@ -176,45 +187,18 @@ async def cmd_start(m: types.Message, bot: Bot, command: CommandObject, state: F
         f"Для подключения используйте:\n<code>{username}</code>"
     )
     
-    # БЕЗОПАСНОЕ СОЗДАНИЕ КНОПОК
-    
-    
     username_to_copy = f"@{bot_info.username}"
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="Скопировать @username",
-                    copy_text=CopyTextButton(text=username_to_copy)
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="Подробная инструкция",
-                    url=f"https://t.me/{bot_info.username}"
-                )
-            ]
+            [InlineKeyboardButton(text="Скопировать @username", copy_text=CopyTextButton(text=username_to_copy))],
+            [InlineKeyboardButton(text="Подробная инструкция", url=f"https://t.me/{bot_info.username}")]
         ]
     )
 
     if os.path.exists(START_PHOTO_PATH):
-        await m.answer_photo(
-            photo=FSInputFile(START_PHOTO_PATH),
-            caption=welcome_text,
-            reply_markup=kb,
-            parse_mode="HTML"
-        )
+        await m.answer_photo(photo=FSInputFile(START_PHOTO_PATH), caption=welcome_text, reply_markup=kb, parse_mode="HTML")
     else:
-        await m.answer(
-            welcome_text,
-            reply_markup=kb,
-            parse_mode="HTML"
-        )
-
-@router.callback_query(F.data == "copy_fallback")
-async def copy_fallback(call: CallbackQuery, bot: Bot):
-    bot_info = await bot.get_me()
-    await call.answer(f"@{bot_info.username}", show_alert=True)
+        await m.answer(welcome_text, reply_markup=kb, parse_mode="HTML")
 
 # --- ЛИЧНЫЕ НАСТРОЙКИ КЛИЕНТА ---
 
@@ -230,7 +214,7 @@ async def cmd_settings(m: types.Message, state: FSMContext):
         
         is_paid = acc.subscription_until and acc.subscription_until > datetime.now()
         status_text = f"Premium ⭐ (до {acc.subscription_until.strftime('%d.%m.%Y')})" if is_paid else "Базовый 👤"
-        att_text = "Бесконечно" if is_paid or acc.attempts == 0 else f"{acc.attempts} шт."
+        att_text = "Бесконечно ⭐" if is_paid else f"{acc.attempts} шт."
         
         text = f"⚙️ <b>Ваши настройки</b>\n\nСтатус: <b>{status_text}</b>\nОсталось попыток: <b>{att_text}</b>"
         await m.answer(text, reply_markup=get_client_settings_kb(acc), parse_mode="HTML")
@@ -492,7 +476,7 @@ async def admin_edit_att_start(call: CallbackQuery, state: FSMContext):
     await state.update_data(target_user_id=user_id)
     await state.set_state(AdminStates.waiting_for_attempts)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data=f"u_menu:{user_id}")]])
-    await call.message.edit_text(f"🔢 Введите число попыток для <code>{user_id}</code> (0 = ∞):", reply_markup=kb, parse_mode="HTML")
+    await call.message.edit_text(f"🔢 Введите число попыток для <code>{user_id}</code>:", reply_markup=kb, parse_mode="HTML")
     await call.answer()
 
 @router.message(AdminStates.waiting_for_attempts, F.from_user.id == ADMIN_ID)
@@ -507,7 +491,7 @@ async def admin_set_att_handler(m: types.Message, state: FSMContext):
         if acc: 
             acc.attempts = new_count
             await session.commit()
-            await m.answer(f"✅ Установлено: {new_count if new_count > 0 else '∞'}")
+            await m.answer(f"✅ Установлено попыток: {new_count} шт.")
     await state.clear()
 
 # --- АДМИНКА: ЧАТЫ ---
@@ -516,7 +500,8 @@ async def admin_set_att_handler(m: types.Message, state: FSMContext):
 async def list_owner_chats(call: CallbackQuery):
     await call.answer()
     data = call.data.split(":")
-    owner_id, page = int(data[1]), int(data[2])
+    owner_id = int(data[1])
+    page = int(data[2]) if len(data) > 2 else 0
     
     async with Session() as session:
         owner_res = await session.execute(select(Conn).where(Conn.user_id == owner_id))
@@ -524,27 +509,39 @@ async def list_owner_chats(call: CallbackQuery):
         owner_info = fmt_user_info(owner.full_name, owner.username, owner_id) if owner else f"ID: {owner_id}"
 
         chat_ids_res = await session.execute(
-            select(MsgLog.chat_id).where(MsgLog.owner_id == owner_id, MsgLog.chat_id != owner_id).distinct().limit(PAGE_SIZE).offset(page * PAGE_SIZE)
+            select(MsgLog.chat_id).where(MsgLog.owner_id == owner_id).distinct().limit(PAGE_SIZE).offset(page * PAGE_SIZE)
         )
         chat_ids = chat_ids_res.scalars().all()
         
         kb = InlineKeyboardMarkup(inline_keyboard=[])
-        for cid in chat_ids:
-            name_res = await session.execute(
-                select(MsgLog.from_name, MsgLog.from_username)
-                .where(MsgLog.owner_id == owner_id, MsgLog.chat_id == cid, MsgLog.from_id != owner_id)
-                .order_by(desc(MsgLog.created_at)).limit(1)
-            )
-            inter = name_res.first()
-            c_btn_text = f"💬 {fmt_user_info(inter[0], inter[1], cid)}" if inter else f"💬 Чат: {cid}"
-            kb.inline_keyboard.append([InlineKeyboardButton(text=c_btn_text, callback_data=f"chat:{owner_id}:{cid}")])
+        
+        if not chat_ids:
+            text = f"📂 <b>Чаты пользователя:</b>\n{owner_info}\n\n<i>Чатов пока нет.</i>"
+        else:
+            text = f"📂 <b>Чаты пользователя:</b>\n{owner_info}"
+            for cid in chat_ids:
+                if cid == owner_id:
+                    c_btn_text = "💬 Избранное (Saved Messages)"
+                else:
+                    name_res = await session.execute(
+                        select(MsgLog.from_name, MsgLog.from_username)
+                        .where(MsgLog.owner_id == owner_id, MsgLog.chat_id == cid, MsgLog.from_id != owner_id)
+                        .order_by(desc(MsgLog.created_at)).limit(1)
+                    )
+                    inter = name_res.first()
+                    if inter and (inter[0] or inter[1]):
+                        c_btn_text = f"💬 {fmt_user_info(inter[0], inter[1], cid)}"
+                    else:
+                        c_btn_text = f"💬 Чат ID: {cid}"
+                    
+                kb.inline_keyboard.append([InlineKeyboardButton(text=c_btn_text, callback_data=f"chat:{owner_id}:{cid}")])
         
         nav_btns = [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"u_menu:{owner_id}")]
         if page > 0: nav_btns.insert(0, InlineKeyboardButton(text="⬅️", callback_data=f"owner:{owner_id}:{page-1}"))
         if len(chat_ids) == PAGE_SIZE: nav_btns.append(InlineKeyboardButton(text="➡️", callback_data=f"owner:{owner_id}:{page+1}"))
         kb.inline_keyboard.append(nav_btns)
         
-        await call.message.edit_text(f"📂 <b>Чаты пользователя:</b>\n{owner_info}", reply_markup=kb, parse_mode="HTML")
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
 @router.callback_query(F.data.startswith("chat:"), F.from_user.id == ADMIN_ID)
 async def chat_menu(call: CallbackQuery):
@@ -601,29 +598,164 @@ async def view_chat_msgs(call: CallbackQuery):
         kb = InlineKeyboardMarkup(inline_keyboard=[nav_btns, [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"chat:{owner_id}:{chat_id}")]])
         await call.message.edit_text(text[:4000], reply_markup=kb, parse_mode="HTML")
 
-# --- АРХИВ МЕДИА (ТЕСТ 1 ЧАС) ---
+# --- ЭКСПОРТЫ И CSV ---
+
+@router.message(F.text.contains("Экспорт всей базы"), F.from_user.id == ADMIN_ID)
+async def export_all_csv(m: types.Message):
+    path = "export.csv"
+    async with Session() as session:
+        res = await session.execute(select(MsgLog).order_by(MsgLog.created_at))
+        rows = res.scalars().all()
+        seen = set(); unique_rows = []
+        for r in rows:
+            key = (r.message_id, r.text)
+            if key not in seen: seen.add(key); unique_rows.append(r)
+            
+        with open(path, "w", encoding="utf-8-sig", newline='') as f:
+            w = csv.writer(f)
+            w.writerow(["Дата (МСК)", "Владелец аккаунта", "От кого", "Кому (Чат)", "Текст", "Файл"])
+            for r in unique_rows:
+                sender = f"@{r.from_username} ({r.from_name})" if r.from_username else f"{r.from_name}"
+                recipient = f"Чат ID:{r.chat_id}"
+                if r.from_id == r.owner_id: recipient = f"Собеседник (Чат ID:{r.chat_id})"
+                else: recipient = f"Владелец ({r.owner_id})"
+                w.writerow([(r.created_at + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M"), r.owner_id, sender, recipient, r.text, r.file_path])
+    await m.answer_document(FSInputFile(path))
+    if os.path.exists(path): os.remove(path)
+
+@router.callback_query(F.data.startswith("u_export:"), F.from_user.id == ADMIN_ID)
+async def export_user_csv(call: CallbackQuery):
+    await call.answer("Формирую...")
+    user_id = int(call.data.split(":")[1])
+    path = f"export_{user_id}.csv"
+    async with Session() as session:
+        res = await session.execute(select(MsgLog).where(MsgLog.owner_id == user_id).order_by(MsgLog.created_at))
+        rows = res.scalars().all()
+        seen = set(); unique_rows = []
+        for r in rows:
+            key = (r.message_id, r.text)
+            if key not in seen: seen.add(key); unique_rows.append(r)
+            
+        with open(path, "w", encoding="utf-8-sig", newline='') as f:
+            w = csv.writer(f)
+            w.writerow(["Дата (МСК)", "От кого", "Кому (Чат)", "Текст", "Файл"])
+            for r in unique_rows:
+                sender = f"@{r.from_username} ({r.from_name})" if r.from_username else f"{r.from_name}"
+                recipient = "Владелец" if r.from_id != user_id else f"Собеседник (Чат ID:{r.chat_id})"
+                w.writerow([(r.created_at + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M"), sender, recipient, r.text, r.file_path])
+    await call.message.answer_document(FSInputFile(path))
+    if os.path.exists(path): os.remove(path)
+
+@router.callback_query(F.data.startswith("c_export:"), F.from_user.id == ADMIN_ID)
+async def export_chat_csv(call: CallbackQuery):
+    await call.answer("Формирую...")
+    _, owner_id, chat_id = call.data.split(":")
+    path = f"chat_{chat_id}.csv"
+    async with Session() as session:
+        res = await session.execute(select(MsgLog).where(MsgLog.owner_id == int(owner_id), MsgLog.chat_id == int(chat_id)).order_by(MsgLog.created_at))
+        rows = res.scalars().all()
+        seen = set(); unique_rows = []
+        for r in rows:
+            key = (r.message_id, r.text)
+            if key not in seen: seen.add(key); unique_rows.append(r)
+            
+        with open(path, "w", encoding="utf-8-sig", newline='') as f:
+            w = csv.writer(f)
+            w.writerow(["Дата (МСК)", "От кого", "Кому", "Текст"])
+            for r in unique_rows:
+                sender = f"@{r.from_username} ({r.from_name})" if r.from_username else f"{r.from_name}"
+                recipient = f"Чат ID:{chat_id}" if r.from_id == int(owner_id) else f"Владелец ID:{owner_id}"
+                w.writerow([(r.created_at + timedelta(hours=3)).strftime("%H:%M"), sender, recipient, r.text])
+    await call.message.answer_document(FSInputFile(path))
+    if os.path.exists(path): os.remove(path)
+
+# --- УМНЫЙ АРХИВ МЕДИА (С ЗАЩИТОЙ ОТ ПОВТОРОВ) ---
+
+def get_archived_files():
+    if not os.path.exists(ARCHIVE_HISTORY_FILE): return set()
+    with open(ARCHIVE_HISTORY_FILE, "r") as f:
+        return set(f.read().splitlines())
+
+def mark_as_archived(filepaths):
+    with open(ARCHIVE_HISTORY_FILE, "a") as f:
+        for p in filepaths:
+            f.write(f"{os.path.basename(p)}\n")
 
 @router.message(F.text.contains("Архив медиа"), F.from_user.id == ADMIN_ID)
-async def create_media_archive(m: types.Message, state: FSMContext):
-    await m.answer("⏳ Сканирую файлы старше 1 часа...")
+async def archive_menu(m: types.Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📦 Архив всего", callback_data="archive:all")],
+        [InlineKeyboardButton(text="⏳ За последние 1 час", callback_data="archive:1")],
+        [InlineKeyboardButton(text="⏳ За последние 6 часов", callback_data="archive:6")],
+        [InlineKeyboardButton(text="⏳ За последние 24 часа", callback_data="archive:24")],
+        [InlineKeyboardButton(text="⏳ За последние 3 дня", callback_data="archive:72")],
+    ])
+    await m.answer("Выберите период для архивации:", reply_markup=kb, parse_mode="HTML")
+
+# НОВЫЙ ШАГ: Спрашиваем про пропуск файлов
+@router.callback_query(F.data.startswith("archive:"), F.from_user.id == ADMIN_ID)
+async def ask_skip_archived(call: CallbackQuery):
+    period = call.data.split(":")[1]
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, пропустить", callback_data=f"do_archive:{period}:skip")],
+        [InlineKeyboardButton(text="❌ Нет, скачать всё", callback_data=f"do_archive:{period}:all")],
+        [InlineKeyboardButton(text="⬅️ Отмена", callback_data="back_to_main")]
+    ])
+    await call.message.edit_text(
+        "Пропустить файлы, которые уже были заархивированы ранее?",
+        reply_markup=kb
+    )
+
+# ИСПОЛНЕНИЕ АРХИВАЦИИ
+@router.callback_query(F.data.startswith("do_archive:"), F.from_user.id == ADMIN_ID)
+async def execute_archive(call: CallbackQuery, state: FSMContext):
+    _, period, skip_mode = call.data.split(":")
+    await call.message.edit_text("⏳ Сканирую файлы... (Смотрите логи на сервере)")
     
     if not os.path.exists(MEDIA_DIR):
-        return await m.answer("Папка с медиа пуста.")
+        return await call.message.edit_text("Папка с медиа пуста.")
 
-    import time
-    import zipfile
-    cutoff_time = time.time() - 3600
+    full_archived_set = get_archived_files()
     files_to_archive = []
-    
-    for f in os.listdir(MEDIA_DIR):
-        path = os.path.join(MEDIA_DIR, f)
-        if os.path.isfile(path) and os.path.getmtime(path) < cutoff_time:
-            files_to_archive.append(path)
+    new_to_archive_txt = [] # Сюда запишем только те, которых еще не было в истории
+    current_time = time.time()
+
+    logger.info(f"--- СТАРТ АРХИВАЦИИ: {period} | Режим пропуска: {skip_mode} ---")
+
+    for root, dirs, files in os.walk(MEDIA_DIR):
+        for f in files:
+            if f == ".archived.txt": continue
+            
+            # Если выбрали "Да, пропустить" и файл уже есть в истории - пропускаем
+            if skip_mode == "skip" and f in full_archived_set:
+                logger.info(f"[ПРОПУСК] {f} (Уже был в архиве)")
+                continue
+
+            path = os.path.join(root, f)
+            file_age_hours = (current_time - os.path.getmtime(path)) / 3600
+
+            add_file = False
+            if period == "all":
+                add_file = True
+                logger.info(f"[ДОБАВЛЕН] {f} (Архив всего)")
+            else:
+                hours = int(period)
+                if file_age_hours <= hours:
+                    add_file = True
+                    logger.info(f"[ДОБАВЛЕН] {f} (Возраст: {file_age_hours:.1f}ч <= {hours}ч)")
+                else:
+                    logger.info(f"[ПРОПУСК] {f} (Слишком старый: {file_age_hours:.1f}ч > {hours}ч)")
+
+            if add_file:
+                files_to_archive.append(path)
+                # Запоминаем файл для истории, только если его там еще нет (чтобы не дублировать записи)
+                if f not in full_archived_set:
+                    new_to_archive_txt.append(path)
 
     if not files_to_archive:
-        return await m.answer("✅ Нет медиафайлов старше 1 часа. Сервер чист.")
+        return await call.message.edit_text("✅ Нет подходящих файлов для архивации за этот период.")
 
-    await m.answer(f"📦 Найдено {len(files_to_archive)} старых файлов. Начинаю упаковку (архивы по ~45 МБ)...")
+    await call.message.edit_text(f"📦 Найдено {len(files_to_archive)} файлов. Начинаю упаковку...")
     
     MAX_ZIP_SIZE = 45 * 1024 * 1024 
     zip_paths = []
@@ -643,26 +775,31 @@ async def create_media_archive(m: types.Message, state: FSMContext):
             zip_paths.append(current_zip_path)
             current_size = 0
 
-        current_zip.write(path, os.path.basename(path))
+        arcname = os.path.relpath(path, MEDIA_DIR)
+        current_zip.write(path, arcname)
         current_size += file_size
 
     current_zip.close()
 
     for zp in zip_paths:
         try:
-            await m.answer_document(FSInputFile(zp))
+            await call.message.answer_document(FSInputFile(zp))
         except Exception as e:
             logger.error(f"Ошибка отправки архива {zp}: {e}")
         finally:
             if os.path.exists(zp): os.remove(zp)
 
+    # Записываем в историю только новые файлы
+    if new_to_archive_txt:
+        mark_as_archived(new_to_archive_txt)
+        
     await state.update_data(files_to_delete=files_to_archive)
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚨 ДА, удалить с сервера", callback_data="confirm_media_delete")],
         [InlineKeyboardButton(text="❌ НЕТ, оставить файлы", callback_data="cancel_media_delete")]
     ])
-    await m.answer(f"✅ Все архивы отправлены.\n\nУдалить эти {len(files_to_archive)} файлов с сервера для освобождения места?", reply_markup=kb)
+    await call.message.answer(f"✅ Все архивы отправлены.\n\nУдалить эти {len(files_to_archive)} файлов с сервера для освобождения места?", reply_markup=kb)
 
 @router.callback_query(F.data == "confirm_media_delete", F.from_user.id == ADMIN_ID)
 async def confirm_media_delete(call: CallbackQuery, state: FSMContext):
@@ -673,7 +810,7 @@ async def confirm_media_delete(call: CallbackQuery, state: FSMContext):
         if os.path.exists(f):
             os.remove(f)
             count += 1
-    await call.message.edit_text(f"✅ Успешно удалено {count} старых медиафайлов. Место освобождено.")
+    await call.message.edit_text(f"✅ Успешно удалено {count} медиафайлов. Место освобождено.")
     await state.clear()
 
 @router.callback_query(F.data == "cancel_media_delete", F.from_user.id == ADMIN_ID)
@@ -681,7 +818,7 @@ async def cancel_media_delete(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text("✅ Файлы оставлены на сервере.")
     await state.clear()
 
-# --- СТАТИСТИКА, ЛОГИ, ЭКСПОРТ ---
+# --- СТАТИСТИКА, ЛОГИ И ВОЗВРАТ ---
 
 @router.message(F.text.contains("Статистика"), F.from_user.id == ADMIN_ID)
 async def stats(m: types.Message):
@@ -705,49 +842,6 @@ async def list_global_logs(m: types.Message):
             sender_info = fmt_user_info(msg.from_name, msg.from_username, msg.from_id)
             text += f"🕒 <code>{time_str}</code> | Аккаунт: {owner_info}\n👤 <b>{sender_info}</b> (ID:<code>#{msg.message_id}</code>): {html.escape(msg.text[:40] if msg.text else '[Медиа]')}\n\n"
         await m.answer(text, parse_mode="HTML")
-
-@router.message(F.text.contains("Экспорт всей базы"), F.from_user.id == ADMIN_ID)
-async def export_all_csv(m: types.Message):
-    path = "export.csv"
-    async with Session() as session:
-        res = await session.execute(select(MsgLog).order_by(MsgLog.created_at))
-        rows = res.scalars().all()
-        seen = set(); unique_rows = []
-        for r in rows:
-            key = (r.message_id, r.text)
-            if key not in seen: seen.add(key); unique_rows.append(r)
-        with open(path, "w", encoding="utf-8-sig", newline='') as f:
-            w = csv.writer(f); w.writerow(["Дата", "Аккаунт", "От кого", "Текст", "Файл"])
-            for r in unique_rows: w.writerow([(r.created_at + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M"), r.owner_id, r.from_name, r.text, r.file_path])
-    await m.answer_document(FSInputFile(path)); os.remove(path)
-
-@router.callback_query(F.data.startswith("u_export:"), F.from_user.id == ADMIN_ID)
-async def export_user_csv(call: CallbackQuery):
-    await call.answer("Формирую..."); user_id = int(call.data.split(":")[1]); path = f"export_{user_id}.csv"
-    async with Session() as session:
-        res = await session.execute(select(MsgLog).where(MsgLog.owner_id == user_id).order_by(MsgLog.created_at))
-        rows = res.scalars().all()
-        seen = set(); unique_rows = []
-        for r in rows:
-            key = (r.message_id, r.text)
-            if key not in seen: seen.add(key); unique_rows.append(r)
-        with open(path, "w", encoding="utf-8-sig", newline='') as f:
-            w = csv.writer(f); w.writerow(["Дата", "От кого", "Текст", "Файл"]); [w.writerow([(r.created_at + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M"), r.from_name, r.text, r.file_path]) for r in unique_rows]
-    await call.message.answer_document(FSInputFile(path)); os.remove(path)
-
-@router.callback_query(F.data.startswith("c_export:"), F.from_user.id == ADMIN_ID)
-async def export_chat_csv(call: CallbackQuery):
-    await call.answer("Формирую..."); _, owner_id, chat_id = call.data.split(":"); path = f"chat_{chat_id}.csv"
-    async with Session() as session:
-        res = await session.execute(select(MsgLog).where(MsgLog.owner_id == int(owner_id), MsgLog.chat_id == int(chat_id)).order_by(MsgLog.created_at))
-        rows = res.scalars().all()
-        seen = set(); unique_rows = []
-        for r in rows:
-            key = (r.message_id, r.text)
-            if key not in seen: seen.add(key); unique_rows.append(r)
-        with open(path, "w", encoding="utf-8-sig", newline='') as f:
-            w = csv.writer(f); w.writerow(["Дата", "От кого", "Текст"]); [w.writerow([(r.created_at + timedelta(hours=3)).strftime("%H:%M"), r.from_name, r.text]) for r in unique_rows]
-    await call.message.answer_document(FSInputFile(path)); os.remove(path)
 
 @router.callback_query(F.data.startswith("media:"), F.from_user.id == ADMIN_ID)
 async def view_chat_media(call: CallbackQuery):

