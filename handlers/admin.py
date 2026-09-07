@@ -337,15 +337,23 @@ async def broadcast_all_exec(call: CallbackQuery, state: FSMContext, bot: Bot):
 async def broadcast_one_list(call: CallbackQuery):
     page = int(call.data.split(":")[2])
     async with Session() as session:
-        res = await session.execute(select(Conn).limit(PAGE_SIZE).offset(page * PAGE_SIZE))
-        conns = res.scalars().all()
+        # ИСПРАВЛЕНО: Берем только уникальные user_id
+        res = await session.execute(
+            select(Conn.user_id).distinct().limit(PAGE_SIZE).offset(page * PAGE_SIZE)
+        )
+        user_ids = res.scalars().all()
+        
         kb = InlineKeyboardMarkup(inline_keyboard=[])
-        for c in conns:
-            kb.inline_keyboard.append([InlineKeyboardButton(text=f"👤 {c.username or c.full_name}", callback_data=f"send_to:{c.user_id}")])
+        for uid in user_ids:
+            c_res = await session.execute(select(Conn).where(Conn.user_id == uid).limit(1))
+            c = c_res.scalars().first()
+            kb.inline_keyboard.append([InlineKeyboardButton(text=f"👤 {c.username or c.full_name}", callback_data=f"send_to:{uid}")])
+            
         nav = []
         if page > 0: nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"broadcast:one:{page-1}"))
-        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"broadcast:one:{page+1}"))
-        kb.inline_keyboard.append(nav)
+        if len(user_ids) == PAGE_SIZE: nav.append(InlineKeyboardButton(text="➡️", callback_data=f"broadcast:one:{page+1}"))
+        if nav: kb.inline_keyboard.append(nav)
+        
         kb.inline_keyboard.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_broadcast_menu")])
         await call.message.edit_text("Выберите пользователя для личного сообщения:", reply_markup=kb)
 
@@ -415,21 +423,32 @@ async def list_owners_cmd(m: types.Message):
 
 async def list_owners(m, page: int):
     async with Session() as session:
-        res = await session.execute(select(Conn).limit(PAGE_SIZE).offset(page * PAGE_SIZE))
-        conns = res.scalars().all()
-        if not conns and page == 0: return await m.answer("Пользователей нет.")
+        # ИСПРАВЛЕНО: Берем только уникальные user_id с помощью .distinct()
+        res = await session.execute(
+            select(Conn.user_id).distinct().limit(PAGE_SIZE).offset(page * PAGE_SIZE)
+        )
+        user_ids = res.scalars().all()
+        
+        if not user_ids and page == 0: 
+            if isinstance(m, types.Message): return await m.answer("Пользователей нет.")
+            else: return await m.edit_text("Пользователей нет.")
         
         kb = InlineKeyboardMarkup(inline_keyboard=[])
-        for c in conns:
-            res_acc = await session.execute(select(UserAccount).where(UserAccount.user_id == c.user_id))
+        for uid in user_ids:
+            # Берем самую свежую запись с именем и юзернеймом для этого ID
+            c_res = await session.execute(select(Conn).where(Conn.user_id == uid).limit(1))
+            c = c_res.scalars().first()
+            
+            res_acc = await session.execute(select(UserAccount).where(UserAccount.user_id == uid))
             acc = res_acc.scalars().first()
+            
             is_paid = acc.subscription_until and acc.subscription_until > datetime.now() if acc else False
-            btn_text = f"👤 {fmt_user_info(c.full_name, c.username, c.user_id, is_paid)}"
-            kb.inline_keyboard.append([InlineKeyboardButton(text=btn_text, callback_data=f"u_menu:{c.user_id}")])
+            btn_text = f"👤 {fmt_user_info(c.full_name, c.username, uid, is_paid)}"
+            kb.inline_keyboard.append([InlineKeyboardButton(text=btn_text, callback_data=f"u_menu:{uid}")])
         
         nav_btns = []
         if page > 0: nav_btns.append(InlineKeyboardButton(text="⬅️", callback_data=f"own_pg:{page-1}"))
-        if len(conns) == PAGE_SIZE: nav_btns.append(InlineKeyboardButton(text="➡️", callback_data=f"own_pg:{page+1}"))
+        if len(user_ids) == PAGE_SIZE: nav_btns.append(InlineKeyboardButton(text="➡️", callback_data=f"own_pg:{page+1}"))
         if nav_btns: kb.inline_keyboard.append(nav_btns)
         
         text = f"👥 <b>Список владельцев (Стр. {page+1}):</b>"
