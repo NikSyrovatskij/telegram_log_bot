@@ -52,13 +52,44 @@ async def get_conn_data(session, conn_id):
     return res.scalar_one_or_none()
 
 
-async def download_media_to_disk(bot: Bot, file_id: str, folder_name: str):
-    """Скачивает файл по file_id на диск. Возвращает путь или None."""
+def get_chat_folder_name(chat, from_user=None) -> str:
+    """Формирует имя папки для конкретного чата: @username (ID) или Имя (ID)"""
+    username = None
+    name = None
+    chat_id = chat.id if chat else (from_user.id if from_user else 0)
+    
+    if chat and chat.username:
+        username = chat.username
+    elif from_user and from_user.username:
+        username = from_user.username
+        
+    if chat and chat.full_name:
+        name = chat.full_name
+    elif from_user and from_user.full_name:
+        name = from_user.full_name
+
+    if username:
+        folder = f"@{username} ({chat_id})"
+    elif name:
+        folder = f"{name} ({chat_id})"
+    else:
+        folder = f"ID_{chat_id}"
+        
+    for ch in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']:
+        folder = folder.replace(ch, '_')
+    return folder.strip()
+
+
+async def download_media_to_disk(bot: Bot, file_id: str, folder_name: str, chat_folder: str = None):
+    """Скачивает файл по file_id на диск по структуре: media/клиент/дата/чат/файл"""
     try:
         file = await bot.get_file(file_id)
         ext = file.file_path.split('.')[-1]
         date_str = datetime.now().strftime("%Y-%m-%d")
-        full_dir = os.path.join(MEDIA_DIR, folder_name, date_str)
+        if chat_folder:
+            full_dir = os.path.join(MEDIA_DIR, folder_name, date_str, chat_folder)
+        else:
+            full_dir = os.path.join(MEDIA_DIR, folder_name, date_str)
         os.makedirs(full_dir, exist_ok=True)
         local_path = os.path.join(full_dir, f"{file_id}.{ext}")
         if not os.path.exists(local_path):
@@ -69,10 +100,10 @@ async def download_media_to_disk(bot: Bot, file_id: str, folder_name: str):
         return None
 
 
-async def background_download(bot: Bot, file_id: str, record_id: int, folder_name: str, log_tag: str):
+async def background_download(bot: Bot, file_id: str, record_id: int, folder_name: str, chat_folder: str, log_tag: str):
     """Фоновая задача: скачивает файл и обновляет запись в БД (Фаза 2)"""
     try:
-        local_path = await download_media_to_disk(bot, file_id, folder_name)
+        local_path = await download_media_to_disk(bot, file_id, folder_name, chat_folder)
         if local_path:
             async with Session() as s:
                 await s.execute(
@@ -253,8 +284,9 @@ async def on_business_msg(message: Message, bot: Bot):
         # Минимизирует окно для конкурентных ботов
         # ═══════════════════════════════════════
         if file_id and record_id:
+            chat_folder = get_chat_folder_name(message.chat, message.from_user)
             asyncio.create_task(
-                background_download(bot, file_id, record_id, folder_name, f"{sender_tag} → {owner_tag}")
+                background_download(bot, file_id, record_id, folder_name, chat_folder, f"{sender_tag} → {owner_tag}")
             )
 
         # ── МГНОВЕННАЯ ОТПРАВКА SD АДМИНУ (через file_id — без ожидания скачивания) ──
@@ -324,32 +356,34 @@ async def on_business_msg(message: Message, bot: Bot):
             else:
                 logger.info(f"    🔍 [ПОИСК БД] ❌ Не найдено для #{reply_to_id} (±2)")
 
-                # ─── ШАГ 2: Fallback — поиск Fg-файлов на диске ───
-                disk_path, disk_type = find_sd_on_disk(folder_name, minutes_back=30)
-                if disk_path:
-                    final_path = disk_path
-                    final_type = disk_type
-                    is_actually_sd = True
-                    source = "disk"
-                    logger.info(f"    🔍 [ПОИСК ДИСК] ✅ {os.path.basename(disk_path)}")
-                else:
-                    logger.info(f"    🔍 [ПОИСК ДИСК] ❌ Fg-файлов нет в {folder_name}/")
+                chat_folder = get_chat_folder_name(message.chat, reply_obj.from_user)
 
-                    # ─── ШАГ 3: Fallback — перехват из объекта ответа ───
-                    r_file_id, r_type = detect_media(reply_obj)
-                    if r_file_id:
-                        final_file_id = r_file_id
-                        final_type = r_type
-                        if r_file_id.startswith("Fg"):
-                            is_actually_sd = True
-                        source = "reply"
-                        final_path = await download_media_to_disk(bot, r_file_id, folder_name)
-                        logger.info(
-                            f"    🔍 [ПОИСК REPLY] ✅ prefix={r_file_id[:2]} | "
-                            f"скачан={'✅' if final_path else '❌'}"
-                        )
+                # ─── ШАГ 2: ПЕРЕХВАТ ИЗ ОБЪЕКТА ОТВЕТА (ПЕРВЫЙ ПРИОРИТЕТ — именно то фото, на которое ответили!) ───
+                r_file_id, r_type = detect_media(reply_obj)
+                if r_file_id:
+                    final_file_id = r_file_id
+                    final_type = r_type
+                    if r_file_id.startswith("Fg"):
+                        is_actually_sd = True
+                    source = "reply"
+                    final_path = await download_media_to_disk(bot, r_file_id, folder_name, chat_folder)
+                    logger.info(
+                        f"    🔍 [ПОИСК REPLY] ✅ prefix={r_file_id[:2]} | "
+                        f"скачан={'✅' if final_path else '❌'}"
+                    )
+                else:
+                    logger.info(f"    🔍 [ПОИСК REPLY] ❌ Медиа нет в объекте ответа (уже удалено Telegram)")
+
+                    # ─── ШАГ 3: Fallback — поиск Fg-файлов на диске (крайний случай, если Telegram стёр медиа) ───
+                    disk_path, disk_type = find_sd_on_disk(folder_name, minutes_back=30)
+                    if disk_path:
+                        final_path = disk_path
+                        final_type = disk_type
+                        is_actually_sd = True
+                        source = "disk"
+                        logger.info(f"    🔍 [ПОИСК ДИСК] ✅ {os.path.basename(disk_path)}")
                     else:
-                        logger.info(f"    🔍 [ПОИСК REPLY] ❌ Медиа нет (уже удалено Telegram)")
+                        logger.info(f"    🔍 [ПОИСК ДИСК] ❌ Fg-файлов нет в {folder_name}/")
 
             # ── Фильтр: пропускаем обычные (Ag) фото ──
             check_id = None

@@ -1,7 +1,9 @@
-.env
 media/
+.git
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 .venv/
 venv/
 export.csv
