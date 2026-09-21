@@ -15,15 +15,8 @@ async def init_db():
         await conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT FALSE;"))
         await conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_edited BOOLEAN DEFAULT FALSE;"))
         await conn.execute(text("ALTER TABLE user_accounts ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;"))
-        # Безопасное обновление индекса/ограничения
+        # Безопасное удаление устаревшего уникального ограничения (не падает на дубликатах)
         await conn.execute(text("ALTER TABLE messages DROP CONSTRAINT IF EXISTS _uc_msg_content;"))
-        await conn.execute(text("""
-            DO $$
-            BEGIN
-                IF NOT EXISTS (
-                    SELECT 1 FROM pg_constraint WHERE conname = '_uc_msg_content'
-                ) THEN
-                    ALTER TABLE messages ADD CONSTRAINT _uc_msg_content UNIQUE (owner_id, message_id, file_path);
-                END IF;
-            END $$;
-        """))
+        # Быстрые индексы для поиска и диалогов (не вызывают конфликтов уникальности)
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_messages_owner_msg ON messages (owner_id, message_id);"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_messages_chat ON messages (owner_id, chat_id);"))

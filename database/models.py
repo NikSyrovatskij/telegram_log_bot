@@ -23,7 +23,6 @@ class MsgLog(Base):
     is_deleted: Mapped[bool] = mapped_column(default=False)
     is_edited: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(default=datetime.now)
-    __table_args__ = (UniqueConstraint('owner_id', 'message_id', 'file_path', name='_uc_msg_content'),)
 
 class UserAccount(Base):
     __tablename__ = "user_accounts"
