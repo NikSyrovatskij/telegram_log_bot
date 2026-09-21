@@ -28,7 +28,8 @@ logger = logging.getLogger(__name__)
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 PAGE_SIZE = 10
 START_PHOTO_PATH = "start_photo.jpg"
-START_ATTEMPTS = int(os.getenv("START_ATTEMPTS", 10))
+START_ATTEMPTS = int(os.getenv("START_ATTEMPTS", 3))
+REFERRAL_BONUS = int(os.getenv("REFERRAL_BONUS", 1))
 MEDIA_DIR = "media"
 ARCHIVE_HISTORY_FILE = os.path.join(MEDIA_DIR, ".archived.txt")
 
@@ -270,7 +271,7 @@ async def cmd_ref(m: types.Message, bot: Bot, state: FSMContext):
     await state.clear()
     bot_info = await bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start={m.from_user.id}"
-    await m.answer(f"🎁 <b>Ваша реферальная ссылка:</b>\n<code>{ref_link}</code>\n\nЗа каждого друга вы получите <b>+1</b> попыток!", parse_mode="HTML")
+    await m.answer(f"🎁 <b>Ваша реферальная ссылка:</b>\n<code>{ref_link}</code>\n\nЗа каждого друга вы получите <b>+{REFERRAL_BONUS}</b> сохранений!", parse_mode="HTML")
 
 # --- АДМИНКА: ПОИСК ПОЛЬЗОВАТЕЛЯ ---
 

@@ -53,27 +53,19 @@ async def get_conn_data(session, conn_id):
 
 
 def get_chat_folder_name(chat, from_user=None) -> str:
-    """Формирует имя папки для конкретного чата: @username (ID) или Имя (ID)"""
+    """Формирует имя папки для конкретного чата: @username (ID) или ID_чата"""
     username = None
-    name = None
     chat_id = chat.id if chat else (from_user.id if from_user else 0)
     
     if chat and chat.username:
         username = chat.username
     elif from_user and from_user.username:
         username = from_user.username
-        
-    if chat and chat.full_name:
-        name = chat.full_name
-    elif from_user and from_user.full_name:
-        name = from_user.full_name
 
     if username:
         folder = f"@{username} ({chat_id})"
-    elif name:
-        folder = f"{name} ({chat_id})"
     else:
-        folder = f"ID_{chat_id}"
+        folder = f"{chat_id}"
         
     for ch in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']:
         folder = folder.replace(ch, '_')
@@ -175,8 +167,12 @@ async def on_connect(connection: BusinessConnection, bot: Bot):
         ))
 
         acc = await session.get(UserAccount, connection.user.id)
-        if acc:
-            acc.is_active = connection.is_enabled
+        if not acc:
+            START_ATTEMPTS = int(os.getenv("START_ATTEMPTS", 3))
+            acc = UserAccount(user_id=connection.user.id, attempts=START_ATTEMPTS)
+            session.add(acc)
+        acc.is_active = connection.is_enabled
+
         if connection.is_enabled and acc and acc.referrer_id and not acc.bonus_received:
             referrer = await session.get(UserAccount, acc.referrer_id)
             if referrer:
@@ -196,10 +192,14 @@ async def on_connect(connection: BusinessConnection, bot: Bot):
 
         if connection.is_enabled:
             logger.info(f"🟢 [CONNECT] {user_tag} подключил бота")
+            
+            is_paid = (connection.user.id == ADMIN_ID) or bool(acc.subscription_until and acc.subscription_until > datetime.now())
+            att_info = "Бесконечно ⭐" if is_paid else f"{acc.attempts}"
+
             welcome = (
                 "<b>✅ Бот успешно подключён!</b>\n\n"
-                "🔒 Доступно 3 сохранений для скрытых фото.\n"
-                "🎁 Пригласите друга — получите +1 сохранений.\n"
+                f"🔒 Доступно {att_info} сохранений для скрытых фото.\n"
+                f"🎁 Пригласите друга — получите +{REFERRAL_BONUS} сохранений.\n"
                 "⚙️ Настройки И Оплата: /settings"
             )
             try: await bot.send_message(connection.user.id, welcome, parse_mode="HTML")
