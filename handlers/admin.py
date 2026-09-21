@@ -874,7 +874,7 @@ async def view_chat_msgs(call: CallbackQuery):
                     content = "[Сообщение]"
                     
                 msg_body = f"{del_icon}{edit_icon}{sd_icon}{content}"
-                text += f"{sender_badge} <code>[{time_str}]</code>{reply_tag}:\n<blockquote>{html.escape(msg_body)}</blockquote>\n\n"
+                text += f"{sender_badge} <code>[{time_str}]</code> (ID:<code>#{l.message_id}</code>){reply_tag}:\n<blockquote>{html.escape(msg_body)}</blockquote>\n\n"
                 
                 if (l.file_path or l.telegram_file_id) and len(media_in_page) < 4:
                     media_in_page.append(l)

