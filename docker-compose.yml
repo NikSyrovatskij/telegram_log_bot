@@ -10,13 +10,19 @@ services:
       POSTGRES_DB: log_db
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U log_user -d log_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   bot:
     build: .
     container_name: log_bot
     restart: always
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     env_file:
       - .env
     volumes:

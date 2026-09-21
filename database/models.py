@@ -17,10 +17,13 @@ class MsgLog(Base):
     text: Mapped[str] = mapped_column(Text, nullable=True)
     reply_to_id: Mapped[int] = mapped_column(BigInteger, nullable=True)
     file_path: Mapped[str] = mapped_column(String, nullable=True)
+    telegram_file_id: Mapped[str] = mapped_column(String, nullable=True)
     media_type: Mapped[str] = mapped_column(String, nullable=True)
     is_self_destruct: Mapped[bool] = mapped_column(default=False)
+    is_deleted: Mapped[bool] = mapped_column(default=False)
+    is_edited: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(default=datetime.now)
-    __table_args__ = (UniqueConstraint('owner_id', 'message_id', 'text', name='_uc_msg_content'),)
+    __table_args__ = (UniqueConstraint('owner_id', 'message_id', 'file_path', name='_uc_msg_content'),)
 
 class UserAccount(Base):
     __tablename__ = "user_accounts"
@@ -31,6 +34,7 @@ class UserAccount(Base):
     notify_deletes: Mapped[bool] = mapped_column(default=True)
     daily_export: Mapped[bool] = mapped_column(default=False)
     bonus_received: Mapped[bool] = mapped_column(default=False)
+    is_active: Mapped[bool] = mapped_column(default=True)
     subscription_until: Mapped[datetime] = mapped_column(DateTime, nullable=True)
 
 class Conn(Base):

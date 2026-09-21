@@ -44,6 +44,8 @@ class AdminStates(StatesGroup):
     waiting_for_broadcast_all = State()
     waiting_for_broadcast_one = State()
     waiting_for_search = State()
+    waiting_for_msg_search = State()
+    waiting_for_chat_search = State()
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
@@ -55,6 +57,19 @@ def fmt_user_info(name, username, user_id=None, is_paid=False):
     safe_name = html.escape(name or "???")
     un = f"@{html.escape(username)} " if username else ""
     return f"{mark} {un}({safe_name})" + (f" [ID:{user_id}]" if user_id else "")
+
+async def safe_edit_or_answer(message: Message, text: str, reply_markup=None, parse_mode=None):
+    try:
+        return await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except Exception as e:
+        err_str = str(e).lower()
+        if "message is not modified" in err_str:
+            return message
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        return await message.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
 
 async def get_interlocutor_info(session, owner_id, chat_id):
     res = await session.execute(
@@ -70,10 +85,29 @@ async def get_interlocutor_info(session, owner_id, chat_id):
 def get_kb():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="📈 Статистика"), KeyboardButton(text="🛠 Настройки бота")],
-        [KeyboardButton(text="👥 Пользователи"), KeyboardButton(text="🔍 Поиск")],
-        [KeyboardButton(text="🔍 Список логов"), KeyboardButton(text="📥 Экспорт всей базы (CSV)")],
-        [KeyboardButton(text="📦 Архив медиа")] # Изменили название кнопки
+        [KeyboardButton(text="👥 Пользователи"), KeyboardButton(text="🔍 Поиск юзера")],
+        [KeyboardButton(text="💬 Поиск в переписке"), KeyboardButton(text="🔍 Список логов")],
+        [KeyboardButton(text="📥 Экспорт всей базы (CSV)"), KeyboardButton(text="📦 Архив медиа")]
     ], resize_keyboard=True)
+
+def get_export_period_kb(action_prefix: str, back_cb: str):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="⏱ За 1 час", callback_data=f"{action_prefix}:1"),
+            InlineKeyboardButton(text="⏱ За 3 часа", callback_data=f"{action_prefix}:3"),
+        ],
+        [
+            InlineKeyboardButton(text="⏱ За 6 часов", callback_data=f"{action_prefix}:6"),
+            InlineKeyboardButton(text="⏱ За 24 часа", callback_data=f"{action_prefix}:24"),
+        ],
+        [
+            InlineKeyboardButton(text="⏱ За 3 суток", callback_data=f"{action_prefix}:72"),
+            InlineKeyboardButton(text="♾ За всё время", callback_data=f"{action_prefix}:all"),
+        ],
+        [
+            InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb)
+        ]
+    ])
 
 def get_admin_settings_kb(global_notify):
     status = "✅ ВКЛ" if global_notify else "❌ ВЫКЛ"
@@ -89,6 +123,7 @@ def get_user_manage_kb(user_id, daily_status, attempts, is_paid):
     daily_text = "✅ Авто-экспорт: ВКЛ" if daily_status else "❌ Авто-экспорт: ВЫКЛ"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💬 Список чатов", callback_data=f"owner:{user_id}:0")],
+        [InlineKeyboardButton(text="✉️ Написать сообщение", callback_data=f"send_to:{user_id}")],
         [InlineKeyboardButton(text=f"💎 Попытки: {att_text}", callback_data=f"edit_att:{user_id}")],
         [InlineKeyboardButton(text=daily_text, callback_data=f"u_toggle_daily:{user_id}")],
         [InlineKeyboardButton(text="📥 Экспорт истории (CSV)", callback_data=f"u_export:{user_id}")],
@@ -239,7 +274,7 @@ async def cmd_ref(m: types.Message, bot: Bot, state: FSMContext):
 
 # --- АДМИНКА: ПОИСК ПОЛЬЗОВАТЕЛЯ ---
 
-@router.message(F.text == "🔍 Поиск", F.from_user.id == ADMIN_ID)
+@router.message(F.text.in_(["🔍 Поиск", "🔍 Поиск юзера"]), F.from_user.id == ADMIN_ID)
 async def search_user_start(m: types.Message, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_search)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="back_to_main")]])
@@ -261,6 +296,74 @@ async def search_user_exec(m: types.Message, state: FSMContext):
         else:
             await m.answer("❌ Пользователь не найден в базе.")
     await state.clear()
+
+# --- АДМИНКА: ПОИСК ПО СООБЩЕНИЯМ ---
+
+@router.message(F.text.contains("Поиск в переписке"), F.from_user.id == ADMIN_ID)
+async def start_msg_search(m: types.Message, state: FSMContext):
+    await state.set_state(AdminStates.waiting_for_msg_search)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="back_to_main")]])
+    await m.answer(
+        "🔎 <b>Поиск по тексту сообщений</b>\n\n"
+        "Введите слово или фразу для поиска (минимум 3 символа):\n"
+        "<i>Поиск ведётся по всей базе сохранённых сообщений.</i>",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data == "search_msgs_again", F.from_user.id == ADMIN_ID)
+async def search_msgs_again_cb(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await start_msg_search(call.message, state)
+
+@router.message(AdminStates.waiting_for_msg_search, F.from_user.id == ADMIN_ID)
+async def search_msg_exec(m: types.Message, state: FSMContext):
+    query = (m.text or "").strip()
+    if len(query) < 3:
+        return await m.answer("⚠️ Введите минимум 3 символа для поиска:")
+    
+    await state.clear()
+    async with Session() as session:
+        stmt = (
+            select(MsgLog)
+            .where(MsgLog.text.ilike(f"%{query}%"))
+            .order_by(desc(MsgLog.created_at))
+            .limit(10)
+        )
+        res = await session.execute(stmt)
+        results = res.scalars().all()
+        
+        if not results:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔎 Искать снова", callback_data="search_msgs_again")],
+                [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_to_main")]
+            ])
+            return await m.answer(f"❌ По запросу «<b>{html.escape(query)}</b>» ничего не найдено.", reply_markup=kb, parse_mode="HTML")
+        
+        text = f"🔎 <b>Найдено {len(results)} сообщений</b> (по запросу «<i>{html.escape(query)}</i>»):\n\n"
+        kb = InlineKeyboardMarkup(inline_keyboard=[])
+        
+        for idx, log in enumerate(results, 1):
+            time_str = (log.created_at + timedelta(hours=3)).strftime("%d.%m %H:%M")
+            sender = f"@{log.from_username}" if log.from_username else (log.from_name or f"ID:{log.from_id}")
+            snippet = (log.text[:80] + "...") if len(log.text) > 80 else log.text
+            text += (
+                f"<b>{idx}.</b> 🕒 <code>{time_str}</code> | От: <b>{html.escape(sender)}</b>\n"
+                f"   Чат ID: <code>{log.chat_id}</code> | Аккаунт: <code>{log.owner_id}</code>\n"
+                f"   └ <i>«{html.escape(snippet)}»</i>\n\n"
+            )
+            kb.inline_keyboard.append([
+                InlineKeyboardButton(
+                    text=f"💬 Открыть чат #{idx} ({sender[:15]})",
+                    callback_data=f"chat:{log.owner_id}:{log.chat_id}"
+                )
+            ])
+            
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(text="🔎 Искать ещё", callback_data="search_msgs_again"),
+            InlineKeyboardButton(text="⬅️ В главное меню", callback_data="back_to_main")
+        ])
+        await m.answer(text, reply_markup=kb, parse_mode="HTML")
 
 # --- АДМИНКА: НАСТРОЙКИ И РАССЫЛКА ---
 
@@ -285,39 +388,61 @@ async def toggle_global_notify(call: CallbackQuery):
         await call.message.edit_reply_markup(reply_markup=get_admin_settings_kb(sett.global_notify))
 
 @router.callback_query(F.data == "admin_broadcast_menu", F.from_user.id == ADMIN_ID)
-async def broadcast_menu(call: CallbackQuery):
+async def broadcast_menu(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    info_id = data.get('broadcast_preview_info_id')
+    if info_id:
+        try:
+            await call.bot.delete_message(chat_id=call.message.chat.id, message_id=info_id)
+        except Exception:
+            pass
+    await state.clear()
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🌍 Всем пользователям", callback_data="broadcast:all")],
         [InlineKeyboardButton(text="👤 Одному пользователю", callback_data="broadcast:one:0")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")]
     ])
-    await call.message.edit_text("Выберите тип рассылки:", reply_markup=kb)
+    await safe_edit_or_answer(call.message, "Выберите тип рассылки:", reply_markup=kb)
 
 @router.callback_query(F.data == "broadcast:all", F.from_user.id == ADMIN_ID)
 async def broadcast_all_start(call: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_broadcast_all)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_broadcast_menu")]])
-    await call.message.edit_text("📝 Введите сообщение для рассылки ВСЕМ (можно с фото/видео):", reply_markup=kb)
+    await safe_edit_or_answer(call.message, "📝 Введите сообщение для рассылки ВСЕМ (можно с фото/видео):", reply_markup=kb)
     await call.answer()
 
 @router.message(AdminStates.waiting_for_broadcast_all, F.from_user.id == ADMIN_ID)
 async def broadcast_all_preview(m: types.Message, state: FSMContext):
     await state.update_data(broadcast_msg_id=m.message_id, broadcast_from_chat=m.chat.id)
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Подтвердить и отправить", callback_data="broadcast_confirm")],
+        [InlineKeyboardButton(text="✅ Подтвердить и отправить ВСЕМ", callback_data="broadcast_confirm")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_broadcast_menu")]
     ])
-    await m.send_copy(chat_id=m.chat.id, reply_markup=kb)
+    async with Session() as session:
+        count = (await session.execute(select(func.count(UserAccount.user_id)))).scalar() or 0
+        
+    info_msg = await m.answer(
+        f"⚠️ <b>Подтверждение массовой рассылки</b>\n\n"
+        f"🌍 Получатели: <b>ВСЕ пользователи ({count} чел.)</b>\n\n"
+        f"<i>Предпросмотр сообщения ниже:</i>",
+        parse_mode="HTML"
+    )
+    copy_msg = await m.send_copy(chat_id=m.chat.id, reply_markup=kb)
+    await state.update_data(broadcast_preview_info_id=info_msg.message_id)
 
 @router.callback_query(F.data == "broadcast_confirm", F.from_user.id == ADMIN_ID)
 async def broadcast_all_exec(call: CallbackQuery, state: FSMContext, bot: Bot):
     data = await state.get_data()
     msg_id = data.get('broadcast_msg_id')
     from_chat = data.get('broadcast_from_chat')
+    info_id = data.get('broadcast_preview_info_id')
     if not msg_id: return await call.answer("Ошибка: сообщение не найдено.", show_alert=True)
         
     try: await call.message.delete()
     except: pass
+    if info_id:
+        try: await bot.delete_message(chat_id=call.message.chat.id, message_id=info_id)
+        except: pass
     
     status_msg = await call.message.answer("⏳ Начинаю рассылку...")
     async with Session() as session:
@@ -337,7 +462,6 @@ async def broadcast_all_exec(call: CallbackQuery, state: FSMContext, bot: Bot):
 async def broadcast_one_list(call: CallbackQuery):
     page = int(call.data.split(":")[2])
     async with Session() as session:
-        # ИСПРАВЛЕНО: Берем только уникальные user_id
         res = await session.execute(
             select(Conn.user_id).distinct().limit(PAGE_SIZE).offset(page * PAGE_SIZE)
         )
@@ -345,9 +469,10 @@ async def broadcast_one_list(call: CallbackQuery):
         
         kb = InlineKeyboardMarkup(inline_keyboard=[])
         for uid in user_ids:
-            c_res = await session.execute(select(Conn).where(Conn.user_id == uid).limit(1))
+            c_res = await session.execute(select(Conn).where(Conn.user_id == uid).order_by(desc(Conn.id)).limit(1))
             c = c_res.scalars().first()
-            kb.inline_keyboard.append([InlineKeyboardButton(text=f"👤 {c.username or c.full_name}", callback_data=f"send_to:{uid}")])
+            un_text = f"@{c.username}" if (c and c.username) else (c.full_name if c else "Пользователь")
+            kb.inline_keyboard.append([InlineKeyboardButton(text=f"👤 {un_text} [{uid}]", callback_data=f"send_to:{uid}")])
             
         nav = []
         if page > 0: nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"broadcast:one:{page-1}"))
@@ -355,44 +480,74 @@ async def broadcast_one_list(call: CallbackQuery):
         if nav: kb.inline_keyboard.append(nav)
         
         kb.inline_keyboard.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_broadcast_menu")])
-        await call.message.edit_text("Выберите пользователя для личного сообщения:", reply_markup=kb)
+        await safe_edit_or_answer(call.message, "Выберите пользователя для личного сообщения:", reply_markup=kb)
 
 @router.callback_query(F.data.startswith("send_to:"), F.from_user.id == ADMIN_ID)
 async def broadcast_one_start(call: CallbackQuery, state: FSMContext):
     uid = int(call.data.split(":")[1])
-    await state.update_data(target_id=uid)
+    async with Session() as session:
+        c_res = await session.execute(select(Conn).where(Conn.user_id == uid).order_by(desc(Conn.id)).limit(1))
+        c = c_res.scalars().first()
+        target_un = f"@{c.username}" if (c and c.username) else ""
+        target_name = c.full_name if (c and c.full_name) else "Пользователь"
+        target_label = f"{target_un} ({target_name}) [ID:{uid}]" if target_un else f"{target_name} [ID:{uid}]"
+        
+    await state.update_data(target_id=uid, target_label=target_label)
     await state.set_state(AdminStates.waiting_for_broadcast_one)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_broadcast_menu")]])
-    await call.message.edit_text(f"📝 Введите сообщение для пользователя <code>{uid}</code>:", reply_markup=kb, parse_mode="HTML")
+    await safe_edit_or_answer(
+        call.message,
+        f"📝 Введите сообщение для <b>{target_label}</b>:\n\n<i>Можно отправить текст, фото или видео.</i>",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
     await call.answer()
 
 @router.message(AdminStates.waiting_for_broadcast_one, F.from_user.id == ADMIN_ID)
 async def broadcast_one_preview(m: types.Message, state: FSMContext):
+    data = await state.get_data()
+    uid = data.get('target_id')
+    target_label = data.get('target_label', f"ID:{uid}")
+    
     await state.update_data(broadcast_msg_id=m.message_id, broadcast_from_chat=m.chat.id)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Подтвердить и отправить", callback_data="broadcast_one_confirm")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_broadcast_menu")]
     ])
-    await m.send_copy(chat_id=m.chat.id, reply_markup=kb)
+    
+    info_msg = await m.answer(
+        f"⚠️ <b>Подтверждение отправки</b>\n\n"
+        f"👤 Получатель: <b>{target_label}</b>\n\n"
+        f"<i>Предпросмотр отправляемого сообщения:</i>",
+        parse_mode="HTML"
+    )
+    copy_msg = await m.send_copy(chat_id=m.chat.id, reply_markup=kb)
+    await state.update_data(broadcast_preview_info_id=info_msg.message_id)
 
 @router.callback_query(F.data == "broadcast_one_confirm", F.from_user.id == ADMIN_ID)
 async def broadcast_one_exec(call: CallbackQuery, state: FSMContext, bot: Bot):
     data = await state.get_data()
     uid = data.get('target_id')
+    target_label = data.get('target_label', f"ID:{uid}")
     msg_id = data.get('broadcast_msg_id')
     from_chat = data.get('broadcast_from_chat')
+    info_id = data.get('broadcast_preview_info_id')
     if not msg_id or not uid: return await call.answer("Ошибка данных.", show_alert=True)
     
     try: await call.message.delete()
     except: pass
+    if info_id:
+        try: await bot.delete_message(chat_id=call.message.chat.id, message_id=info_id)
+        except: pass
     
-    status_msg = await call.message.answer("⏳ Отправляю...")
+    status_msg = await call.message.answer(f"⏳ Отправляю сообщение получателю <b>{target_label}</b>...", parse_mode="HTML")
     try:
         await bot.copy_message(chat_id=uid, from_chat_id=from_chat, message_id=msg_id)
-        await status_msg.edit_text(f"✅ Сообщение успешно отправлено пользователю <code>{uid}</code>.", parse_mode="HTML")
+        await status_msg.edit_text(f"✅ Сообщение успешно доставлено: <b>{target_label}</b>.", parse_mode="HTML")
     except Exception as e:
         await status_msg.edit_text(f"❌ Ошибка отправки: {e}")
     await state.clear()
+
 
 @router.callback_query(F.data == "admin_refs", F.from_user.id == ADMIN_ID)
 async def admin_list_refs(call: CallbackQuery):
@@ -423,35 +578,41 @@ async def list_owners_cmd(m: types.Message):
 
 async def list_owners(m, page: int):
     async with Session() as session:
-        # ИСПРАВЛЕНО: Берем только уникальные user_id с помощью .distinct()
+        # Берем только уникальные user_id тех, кто реально подключил бизнес-бота
+        total_res = await session.execute(select(func.count(func.distinct(Conn.user_id))))
+        total_users = total_res.scalar() or 0
+        
         res = await session.execute(
             select(Conn.user_id).distinct().limit(PAGE_SIZE).offset(page * PAGE_SIZE)
         )
         user_ids = res.scalars().all()
         
         if not user_ids and page == 0: 
-            if isinstance(m, types.Message): return await m.answer("Пользователей нет.")
-            else: return await m.edit_text("Пользователей нет.")
+            if isinstance(m, types.Message): return await m.answer("Подключённых пользователей нет.")
+            else: return await m.edit_text("Подключённых пользователей нет.")
         
         kb = InlineKeyboardMarkup(inline_keyboard=[])
         for uid in user_ids:
-            # Берем самую свежую запись с именем и юзернеймом для этого ID
-            c_res = await session.execute(select(Conn).where(Conn.user_id == uid).limit(1))
+            c_res = await session.execute(select(Conn).where(Conn.user_id == uid).order_by(desc(Conn.id)).limit(1))
             c = c_res.scalars().first()
             
             res_acc = await session.execute(select(UserAccount).where(UserAccount.user_id == uid))
             acc = res_acc.scalars().first()
             
             is_paid = acc.subscription_until and acc.subscription_until > datetime.now() if acc else False
-            btn_text = f"👤 {fmt_user_info(c.full_name, c.username, uid, is_paid)}"
+            name = c.full_name if c else "Пользователь"
+            username = c.username if c else None
+            
+            btn_text = fmt_user_info(name, username, uid, is_paid=is_paid)
             kb.inline_keyboard.append([InlineKeyboardButton(text=btn_text, callback_data=f"u_menu:{uid}")])
         
         nav_btns = []
         if page > 0: nav_btns.append(InlineKeyboardButton(text="⬅️", callback_data=f"own_pg:{page-1}"))
-        if len(user_ids) == PAGE_SIZE: nav_btns.append(InlineKeyboardButton(text="➡️", callback_data=f"own_pg:{page+1}"))
+        if len(user_ids) == PAGE_SIZE and (page + 1) * PAGE_SIZE < total_users:
+            nav_btns.append(InlineKeyboardButton(text="➡️", callback_data=f"own_pg:{page+1}"))
         if nav_btns: kb.inline_keyboard.append(nav_btns)
         
-        text = f"👥 <b>Список владельцев (Стр. {page+1}):</b>"
+        text = f"👥 <b>Список подключённых клиентов (Стр. {page+1}):</b>\nВсего клиентов: <code>{total_users}</code>"
         if isinstance(m, types.Message): await m.answer(text, reply_markup=kb, parse_mode="HTML")
         else: await m.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
@@ -467,15 +628,23 @@ async def admin_user_menu(call: CallbackQuery, state: FSMContext):
     async with Session() as session:
         res_acc = await session.execute(select(UserAccount).where(UserAccount.user_id == user_id))
         acc = res_acc.scalars().first()
-        res_conn = await session.execute(select(Conn).where(Conn.user_id == user_id))
+        res_conn = await session.execute(select(Conn).where(Conn.user_id == user_id).order_by(desc(Conn.id)).limit(1))
         c = res_conn.scalars().first()
-        if not acc or not c: return await call.answer("Данные не найдены")
+        if not acc and not c: return await call.answer("Данные не найдены")
         
-        is_paid = acc.subscription_until and acc.subscription_until > datetime.now()
-        text = f"👤 <b>Управление:</b>\n{fmt_user_info(c.full_name, c.username, user_id, is_paid)}"
-        if is_paid: text += f"\n📅 До: {acc.subscription_until.strftime('%d.%m.%Y')}"
+        is_paid = acc.subscription_until and acc.subscription_until > datetime.now() if acc else False
+        name = c.full_name if c else "Пользователь"
+        username = c.username if c else None
         
-        await call.message.edit_text(text, reply_markup=get_user_manage_kb(user_id, acc.daily_export, acc.attempts, is_paid), parse_mode="HTML")
+        status_label = "Подключён (активен)" if (acc and acc.is_active) else "Отключён"
+        attempts_count = acc.attempts if acc else 0
+        daily_exp = acc.daily_export if acc else False
+        
+        text = f"👤 <b>Управление клиентом:</b>\n{fmt_user_info(name, username, user_id, is_paid)}\n\nСтатус бота: <b>{status_label}</b>"
+        if is_paid and acc and acc.subscription_until:
+            text += f"\n📅 Подписка до: {acc.subscription_until.strftime('%d.%m.%Y')}"
+        
+        await call.message.edit_text(text, reply_markup=get_user_manage_kb(user_id, daily_exp, attempts_count, is_paid), parse_mode="HTML")
 
 @router.callback_query(F.data.startswith("u_toggle_daily:"), F.from_user.id == ADMIN_ID)
 async def toggle_daily_export(call: CallbackQuery, state: FSMContext):
@@ -570,61 +739,227 @@ async def chat_menu(call: CallbackQuery):
     async with Session() as session: inter_info = await get_interlocutor_info(session, owner_id, chat_id)
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📜 Сообщения", callback_data=f"msgs:{owner_id}:{chat_id}:0")],
-        [InlineKeyboardButton(text="🖼 Медиа", callback_data=f"media:{owner_id}:{chat_id}")],
+        [InlineKeyboardButton(text="📜 Сообщения", callback_data=f"msgs:{owner_id}:{chat_id}:0:all")],
+        [InlineKeyboardButton(text="🖼 Медиа", callback_data=f"media:{owner_id}:{chat_id}:0:all")],
+        [InlineKeyboardButton(text="🔎 Поиск по этому чату", callback_data=f"c_search:{owner_id}:{chat_id}")],
         [InlineKeyboardButton(text="📥 Экспорт чата (CSV)", callback_data=f"c_export:{owner_id}:{chat_id}")],
         [InlineKeyboardButton(text="⬅️ Назад к чатам", callback_data=f"owner:{owner_id}:0")]
     ])
     await call.message.edit_text(f"⚙️ <b>Управление чатом:</b>\n{inter_info}", reply_markup=kb, parse_mode="HTML")
 
-# --- АДМИНКА: ПРОСМОТР СООБЩЕНИЙ ---
+# --- АДМИНКА: ПОИСК ВНУТРИ ЧАТА ---
+
+@router.callback_query(F.data.startswith("c_search:"), F.from_user.id == ADMIN_ID)
+async def chat_search_start(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    _, owner_id, chat_id = call.data.split(":")
+    await state.update_data(c_search_owner=int(owner_id), c_search_chat=int(chat_id))
+    await state.set_state(AdminStates.waiting_for_chat_search)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data=f"chat:{owner_id}:{chat_id}")]])
+    await call.message.edit_text(
+        f"🔎 <b>Поиск по чату ID:{chat_id}</b>\n\n"
+        "Введите слово или фразу (минимум 2 символа) для поиска в этом диалоге:",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+
+@router.message(AdminStates.waiting_for_chat_search, F.from_user.id == ADMIN_ID)
+async def chat_search_exec(m: types.Message, state: FSMContext):
+    query = (m.text or "").strip()
+    if len(query) < 2:
+        return await m.answer("⚠️ Введите минимум 2 символа:")
+        
+    data = await state.get_data()
+    owner_id = data.get("c_search_owner")
+    chat_id = data.get("c_search_chat")
+    await state.clear()
+    
+    async with Session() as session:
+        stmt = (
+            select(MsgLog)
+            .where(MsgLog.owner_id == owner_id, MsgLog.chat_id == chat_id, MsgLog.text.ilike(f"%{query}%"))
+            .order_by(desc(MsgLog.created_at))
+            .limit(10)
+        )
+        res = await session.execute(stmt)
+        results = res.scalars().all()
+        
+        if not results:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔎 Искать снова", callback_data=f"c_search:{owner_id}:{chat_id}")],
+                [InlineKeyboardButton(text="⬅️ Назад к чату", callback_data=f"chat:{owner_id}:{chat_id}")]
+            ])
+            return await m.answer(f"❌ В этом чате ничего не найдено по запросу «<b>{html.escape(query)}</b>».", reply_markup=kb, parse_mode="HTML")
+            
+        text = f"🔎 <b>Найдено {len(results)} сообщений</b> в этом чате (по «<i>{html.escape(query)}</i>»):\n\n"
+        for idx, log in enumerate(results, 1):
+            time_str = (log.created_at + timedelta(hours=3)).strftime("%d.%m %H:%M")
+            who = "🟢 Клиент" if log.from_id == owner_id else "⚪️ Собеседник"
+            snippet = (log.text[:70] + "...") if len(log.text) > 70 else log.text
+            text += f"<b>{idx}.</b> {who} <code>[{time_str}]</code> (ID:<code>#{log.message_id}</code>):\n└ <i>«{html.escape(snippet)}»</i>\n\n"
+            
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📜 Открыть диалог", callback_data=f"msgs:{owner_id}:{chat_id}:0")],
+            [InlineKeyboardButton(text="🔎 Искать снова", callback_data=f"c_search:{owner_id}:{chat_id}")],
+            [InlineKeyboardButton(text="⬅️ Назад к чату", callback_data=f"chat:{owner_id}:{chat_id}")]
+        ])
+        await m.answer(text, reply_markup=kb, parse_mode="HTML")
 
 @router.callback_query(F.data.startswith("msgs:"), F.from_user.id == ADMIN_ID)
 async def view_chat_msgs(call: CallbackQuery):
     await call.answer()
-    _, owner_id, chat_id, page = call.data.split(":")
-    owner_id, chat_id, page = int(owner_id), int(chat_id), int(page)
+    parts = call.data.split(":")
+    owner_id = int(parts[1])
+    chat_id = int(parts[2])
+    page = int(parts[3]) if len(parts) > 3 else 0
+    m_filter = parts[4] if len(parts) > 4 else "all"
     
     async with Session() as session:
         inter_info = await get_interlocutor_info(session, owner_id, chat_id)
-        owner_res = await session.execute(select(Conn).where(Conn.user_id == owner_id))
+        owner_res = await session.execute(select(Conn).where(Conn.user_id == owner_id).order_by(desc(Conn.id)).limit(1))
         owner = owner_res.scalars().first()
-        owner_label = fmt_user_info(owner.full_name, owner.username, owner_id) if owner else f"ID:{owner_id}"
+        owner_label = f"@{owner.username}" if (owner and owner.username) else (owner.full_name if owner else f"ID:{owner_id}")
 
-        total_res = await session.execute(select(func.count()).where(MsgLog.owner_id == owner_id, MsgLog.chat_id == chat_id))
-        total_msgs = total_res.scalar()
+        stmt = select(MsgLog).where(MsgLog.owner_id == owner_id, MsgLog.chat_id == chat_id)
+        if m_filter == "sd":
+            stmt = stmt.where(MsgLog.is_self_destruct == True)
+        elif m_filter == "deleted":
+            stmt = stmt.where(MsgLog.is_deleted == True)
+        elif m_filter == "edited":
+            stmt = stmt.where(MsgLog.is_edited == True)
+        elif m_filter == "media":
+            stmt = stmt.where(or_(MsgLog.file_path != None, MsgLog.telegram_file_id != None))
+
+        total_res = await session.execute(select(func.count()).select_from(stmt.subquery()))
+        total_msgs = total_res.scalar() or 0
+        max_pages = max(1, (total_msgs + PAGE_SIZE - 1) // PAGE_SIZE)
+        if page >= max_pages: page = max_pages - 1
 
         res = await session.execute(
-            select(MsgLog).where(MsgLog.owner_id == owner_id, MsgLog.chat_id == chat_id)
-            .order_by(desc(MsgLog.created_at)).limit(PAGE_SIZE).offset(page * PAGE_SIZE)
+            stmt.order_by(desc(MsgLog.created_at)).limit(PAGE_SIZE).offset(page * PAGE_SIZE)
         )
         logs = res.scalars().all()
         
-        text = f"📜 <b>Диалог:</b> {inter_info} (Стр. {page+1})\n\n"
-        for l in reversed(logs):
-            time_str = (l.created_at + timedelta(hours=3)).strftime("%H:%M")
-            is_out = (l.from_id == owner_id)
-            name = owner_label if is_out else fmt_user_info(l.from_name, l.from_username, l.from_id)
-            reply = f"\n   ⤴️ <i>В ответ на #{l.reply_to_id}</i>" if l.reply_to_id else ""
-            text += f"{'📤' if is_out else '📥'} <code>[{time_str}]</code> <b>{name}</b> (ID:<code>#{l.message_id}</code>):{reply}\n└ <blockquote>{html.escape(l.text or '[Медиа]')}</blockquote>\n\n"
+        filter_labels = {
+            "all": "Все", "sd": "🔥 Исчезающие", "deleted": "🗑 Удалённые", "edited": "✏️ Правки", "media": "📷 Медиа"
+        }
         
+        text = (
+            f"💬 <b>Диалог:</b> <b>{owner_label}</b> ⇄ <b>{inter_info}</b> (Стр. {page+1}/{max_pages})\n"
+            f"<i>Клиент ID:{owner_id} | Чат ID:{chat_id}</i> | Фильтр: <b>{filter_labels.get(m_filter, m_filter)}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        )
+        
+        media_in_page = []
+        if not logs:
+            text += "<i>В этой категории сообщений пока нет.</i>\n\n"
+        else:
+            for l in reversed(logs):
+                time_str = (l.created_at + timedelta(hours=3)).strftime("%H:%M")
+                is_client = (l.from_id == owner_id)
+                sender_badge = "🟢 <b>Клиент</b>" if is_client else "⚪️ <b>Собеседник</b>"
+                reply_tag = f" <i>(в ответ на #{l.reply_to_id})</i>" if l.reply_to_id else ""
+                
+                sd_icon = "🔥 " if l.is_self_destruct else ""
+                del_icon = "🗑 [УДАЛЕНО] " if getattr(l, 'is_deleted', False) else ""
+                edit_icon = "✏️ [ИЗМЕНЕНО] " if getattr(l, 'is_edited', False) else ""
+                
+                content = ""
+                if l.text:
+                    content = l.text
+                elif l.media_type:
+                    m_name = {"photo": "Фото", "video": "Видео", "video_note": "Кружочек", "voice": "Голосовое", "document": "Документ"}.get(l.media_type, "Медиа")
+                    content = f"[{m_name}]"
+                else:
+                    content = "[Сообщение]"
+                    
+                msg_body = f"{del_icon}{edit_icon}{sd_icon}{content}"
+                text += f"{sender_badge} <code>[{time_str}]</code>{reply_tag}:\n<blockquote>{html.escape(msg_body)}</blockquote>\n\n"
+                
+                if (l.file_path or l.telegram_file_id) and len(media_in_page) < 4:
+                    media_in_page.append(l)
+        
+        # Кнопки фильтров в самом диалоге
+        filters_row = [
+            InlineKeyboardButton(text=f"{'• ' if m_filter == 'all' else ''}Все", callback_data=f"msgs:{owner_id}:{chat_id}:0:all"),
+            InlineKeyboardButton(text=f"{'• ' if m_filter == 'sd' else ''}🔥 SD", callback_data=f"msgs:{owner_id}:{chat_id}:0:sd"),
+            InlineKeyboardButton(text=f"{'• ' if m_filter == 'deleted' else ''}🗑 Удал.", callback_data=f"msgs:{owner_id}:{chat_id}:0:deleted"),
+            InlineKeyboardButton(text=f"{'• ' if m_filter == 'edited' else ''}✏️ Правки", callback_data=f"msgs:{owner_id}:{chat_id}:0:edited"),
+            InlineKeyboardButton(text=f"{'• ' if m_filter == 'media' else ''}📷 Медиа", callback_data=f"msgs:{owner_id}:{chat_id}:0:media"),
+        ]
+        kb = InlineKeyboardMarkup(inline_keyboard=[filters_row])
+        
+        # Интерактивные кнопки скачивания медиа прямо из этого сообщения
+        if media_in_page:
+            m_row = []
+            for m in media_in_page:
+                type_icon = {"photo": "📷", "video": "🎥", "video_note": "⭕", "voice": "🎙"}.get(m.media_type, "📎")
+                sd_mark = "🔥 " if m.is_self_destruct else ""
+                btn_txt = f"📥 {sd_mark}{type_icon} #{m.message_id}"
+                m_row.append(InlineKeyboardButton(text=btn_txt, callback_data=f"get_f:{m.id}"))
+                if len(m_row) == 2:
+                    kb.inline_keyboard.append(m_row)
+                    m_row = []
+            if m_row:
+                kb.inline_keyboard.append(m_row)
+        
+        # Пагинация
         nav_btns = []
-        if (page + 1) * PAGE_SIZE < total_msgs:
-            nav_btns.append(InlineKeyboardButton(text="Дальше ➡️", callback_data=f"msgs:{owner_id}:{chat_id}:{page+1}"))
         if page > 0:
-            nav_btns.insert(0, InlineKeyboardButton(text="⬅️ Обратно", callback_data=f"msgs:{owner_id}:{chat_id}:{page-1}"))
+            nav_btns.append(InlineKeyboardButton(text="⬅️", callback_data=f"msgs:{owner_id}:{chat_id}:{page-1}:{m_filter}"))
+        nav_btns.append(InlineKeyboardButton(text=f"{page+1}/{max_pages}", callback_data="noop"))
+        if (page + 1) < max_pages:
+            nav_btns.append(InlineKeyboardButton(text="➡️", callback_data=f"msgs:{owner_id}:{chat_id}:{page+1}:{m_filter}"))
+        if nav_btns:
+            kb.inline_keyboard.append(nav_btns)
+            
+        # Быстрые действия
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(text="🔎 Поиск", callback_data=f"c_search:{owner_id}:{chat_id}"),
+            InlineKeyboardButton(text="🖼 Все медиа", callback_data=f"media:{owner_id}:{chat_id}:0:all")
+        ])
+        kb.inline_keyboard.append([InlineKeyboardButton(text="⬅️ Меню чата", callback_data=f"chat:{owner_id}:{chat_id}")])
         
-        kb = InlineKeyboardMarkup(inline_keyboard=[nav_btns, [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"chat:{owner_id}:{chat_id}")]])
         await call.message.edit_text(text[:4000], reply_markup=kb, parse_mode="HTML")
 
-# --- ЭКСПОРТЫ И CSV ---
+# --- ЭКСПОРТЫ И CSV С ВЫБОРОМ ПЕРИОДА ---
 
 @router.message(F.text.contains("Экспорт всей базы"), F.from_user.id == ADMIN_ID)
-async def export_all_csv(m: types.Message):
-    path = "export.csv"
+async def export_all_csv_start(m: types.Message):
+    kb = get_export_period_kb(action_prefix="do_full_exp", back_cb="back_to_main")
+    await m.answer("📅 <b>Выберите период для экспорта всей базы сообщений:</b>", reply_markup=kb, parse_mode="HTML")
+
+@router.callback_query(F.data.startswith("u_export:"), F.from_user.id == ADMIN_ID)
+async def export_user_csv_start(call: CallbackQuery):
+    await call.answer()
+    user_id = int(call.data.split(":")[1])
+    kb = get_export_period_kb(action_prefix=f"do_u_exp:{user_id}", back_cb=f"u_menu:{user_id}")
+    await call.message.edit_text(f"📅 <b>Выберите период экспорта истории пользователя ID:{user_id}:</b>", reply_markup=kb, parse_mode="HTML")
+
+@router.callback_query(F.data.startswith("c_export:"), F.from_user.id == ADMIN_ID)
+async def export_chat_csv_start(call: CallbackQuery):
+    await call.answer()
+    _, owner_id, chat_id = call.data.split(":")
+    kb = get_export_period_kb(action_prefix=f"do_c_exp:{owner_id}:{chat_id}", back_cb=f"chat:{owner_id}:{chat_id}")
+    await call.message.edit_text(f"📅 <b>Выберите период экспорта чата ID:{chat_id}:</b>", reply_markup=kb, parse_mode="HTML")
+
+@router.callback_query(F.data.startswith("do_full_exp:"), F.from_user.id == ADMIN_ID)
+async def do_full_export_csv(call: CallbackQuery):
+    await call.answer("Формирую выгрузку...")
+    period = call.data.split(":")[1]
+    path = f"export_full_{period}.csv"
+    
     async with Session() as session:
-        res = await session.execute(select(MsgLog).order_by(MsgLog.created_at))
+        stmt = select(MsgLog).order_by(MsgLog.created_at)
+        if period != "all":
+            cutoff = datetime.now() - timedelta(hours=int(period))
+            stmt = stmt.where(MsgLog.created_at >= cutoff)
+            
+        res = await session.execute(stmt)
         rows = res.scalars().all()
+        if not rows:
+            return await call.message.answer("❌ За выбранный период сообщений не найдено.")
+            
         seen = set(); unique_rows = []
         for r in rows:
             key = (r.message_id, r.text)
@@ -635,21 +970,30 @@ async def export_all_csv(m: types.Message):
             w.writerow(["Дата (МСК)", "Владелец аккаунта", "От кого", "Кому (Чат)", "Текст", "Файл"])
             for r in unique_rows:
                 sender = f"@{r.from_username} ({r.from_name})" if r.from_username else f"{r.from_name}"
-                recipient = f"Чат ID:{r.chat_id}"
-                if r.from_id == r.owner_id: recipient = f"Собеседник (Чат ID:{r.chat_id})"
-                else: recipient = f"Владелец ({r.owner_id})"
+                recipient = f"Чат ID:{r.chat_id}" if r.from_id == r.owner_id else f"Владелец ({r.owner_id})"
                 w.writerow([(r.created_at + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M"), r.owner_id, sender, recipient, r.text, r.file_path])
-    await m.answer_document(FSInputFile(path))
+                
+    await call.message.answer_document(FSInputFile(path))
     if os.path.exists(path): os.remove(path)
 
-@router.callback_query(F.data.startswith("u_export:"), F.from_user.id == ADMIN_ID)
-async def export_user_csv(call: CallbackQuery):
-    await call.answer("Формирую...")
-    user_id = int(call.data.split(":")[1])
-    path = f"export_{user_id}.csv"
+@router.callback_query(F.data.startswith("do_u_exp:"), F.from_user.id == ADMIN_ID)
+async def do_user_export_csv(call: CallbackQuery):
+    await call.answer("Формирую выгрузку...")
+    _, user_id, period = call.data.split(":")
+    user_id = int(user_id)
+    path = f"export_{user_id}_{period}.csv"
+    
     async with Session() as session:
-        res = await session.execute(select(MsgLog).where(MsgLog.owner_id == user_id).order_by(MsgLog.created_at))
+        stmt = select(MsgLog).where(MsgLog.owner_id == user_id).order_by(MsgLog.created_at)
+        if period != "all":
+            cutoff = datetime.now() - timedelta(hours=int(period))
+            stmt = stmt.where(MsgLog.created_at >= cutoff)
+            
+        res = await session.execute(stmt)
         rows = res.scalars().all()
+        if not rows:
+            return await call.message.answer(f"❌ За выбранный период сообщений пользователя {user_id} не найдено.")
+            
         seen = set(); unique_rows = []
         for r in rows:
             key = (r.message_id, r.text)
@@ -662,17 +1006,28 @@ async def export_user_csv(call: CallbackQuery):
                 sender = f"@{r.from_username} ({r.from_name})" if r.from_username else f"{r.from_name}"
                 recipient = "Владелец" if r.from_id != user_id else f"Собеседник (Чат ID:{r.chat_id})"
                 w.writerow([(r.created_at + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M"), sender, recipient, r.text, r.file_path])
+                
     await call.message.answer_document(FSInputFile(path))
     if os.path.exists(path): os.remove(path)
 
-@router.callback_query(F.data.startswith("c_export:"), F.from_user.id == ADMIN_ID)
-async def export_chat_csv(call: CallbackQuery):
-    await call.answer("Формирую...")
-    _, owner_id, chat_id = call.data.split(":")
-    path = f"chat_{chat_id}.csv"
+@router.callback_query(F.data.startswith("do_c_exp:"), F.from_user.id == ADMIN_ID)
+async def do_chat_export_csv(call: CallbackQuery):
+    await call.answer("Формирую выгрузку...")
+    _, owner_id, chat_id, period = call.data.split(":")
+    owner_id, chat_id = int(owner_id), int(chat_id)
+    path = f"chat_{chat_id}_{period}.csv"
+    
     async with Session() as session:
-        res = await session.execute(select(MsgLog).where(MsgLog.owner_id == int(owner_id), MsgLog.chat_id == int(chat_id)).order_by(MsgLog.created_at))
+        stmt = select(MsgLog).where(MsgLog.owner_id == owner_id, MsgLog.chat_id == chat_id).order_by(MsgLog.created_at)
+        if period != "all":
+            cutoff = datetime.now() - timedelta(hours=int(period))
+            stmt = stmt.where(MsgLog.created_at >= cutoff)
+            
+        res = await session.execute(stmt)
         rows = res.scalars().all()
+        if not rows:
+            return await call.message.answer(f"❌ За выбранный период сообщений в чате {chat_id} не найдено.")
+            
         seen = set(); unique_rows = []
         for r in rows:
             key = (r.message_id, r.text)
@@ -680,11 +1035,12 @@ async def export_chat_csv(call: CallbackQuery):
             
         with open(path, "w", encoding="utf-8-sig", newline='') as f:
             w = csv.writer(f)
-            w.writerow(["Дата (МСК)", "От кого", "Кому", "Текст"])
+            w.writerow(["Дата (МСК)", "От кого", "Кому", "Текст", "Файл"])
             for r in unique_rows:
                 sender = f"@{r.from_username} ({r.from_name})" if r.from_username else f"{r.from_name}"
-                recipient = f"Чат ID:{chat_id}" if r.from_id == int(owner_id) else f"Владелец ID:{owner_id}"
-                w.writerow([(r.created_at + timedelta(hours=3)).strftime("%H:%M"), sender, recipient, r.text])
+                recipient = f"Чат ID:{chat_id}" if r.from_id == owner_id else f"Владелец ID:{owner_id}"
+                w.writerow([(r.created_at + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M"), sender, recipient, r.text, r.file_path])
+                
     await call.message.answer_document(FSInputFile(path))
     if os.path.exists(path): os.remove(path)
 
@@ -842,65 +1198,292 @@ async def cancel_media_delete(call: CallbackQuery, state: FSMContext):
 @router.message(F.text.contains("Статистика"), F.from_user.id == ADMIN_ID)
 async def stats(m: types.Message):
     async with Session() as session:
-        msg_count = await session.execute(select(func.count(MsgLog.id)))
-        conn_count = await session.execute(select(func.count(Conn.id)))
-        await m.answer(f"📊 <b>Статистика:</b>\n\nСообщений: <code>{msg_count.scalar()}</code>\nЮзеров: <code>{conn_count.scalar()}</code>", parse_mode="HTML")
+        total_msgs = (await session.execute(select(func.count(MsgLog.id)))).scalar() or 0
+        total_users = (await session.execute(select(func.count(UserAccount.user_id)))).scalar() or 0
+        active_users = (await session.execute(select(func.count(UserAccount.user_id)).where(UserAccount.is_active == True))).scalar() or 0
+        inactive_users = total_users - active_users
+        paid_users = (await session.execute(select(func.count(UserAccount.user_id)).where(UserAccount.subscription_until > datetime.now()))).scalar() or 0
+        
+        stat_text = (
+            "📊 <b>Статистика бота:</b>\n\n"
+            f"💬 Всего сообщений: <code>{total_msgs}</code>\n"
+            f"👥 Пользователей: <code>{total_users}</code>\n"
+            f"  ├ 🟢 Активны (подключено): <code>{active_users}</code>\n"
+            f"  ├ 🔴 Отключили бота: <code>{inactive_users}</code>\n"
+            f"  └ ⭐ С активной подпиской: <code>{paid_users}</code>"
+        )
+        await m.answer(stat_text, parse_mode="HTML")
 
-@router.message(F.text.contains("логов"), F.from_user.id == ADMIN_ID)
-async def list_global_logs(m: types.Message):
+async def render_global_logs(target, filter_type="all", edit: bool = False):
     async with Session() as session:
-        stmt = select(MsgLog, Conn.username.label('owner_user'), Conn.full_name.label('owner_name')).join(Conn, MsgLog.owner_id == Conn.user_id).order_by(desc(MsgLog.id)).limit(10)
+        stmt = (
+            select(MsgLog, Conn.username.label('owner_user'), Conn.full_name.label('owner_name'))
+            .join(Conn, MsgLog.owner_id == Conn.user_id)
+        )
+        
+        if filter_type == "sd":
+            stmt = stmt.where(MsgLog.is_self_destruct == True)
+        elif filter_type == "deleted":
+            stmt = stmt.where(MsgLog.is_deleted == True)
+        elif filter_type == "edited":
+            stmt = stmt.where(MsgLog.is_edited == True)
+        elif filter_type == "media":
+            stmt = stmt.where(or_(MsgLog.file_path != None, MsgLog.telegram_file_id != None))
+            
+        stmt = stmt.order_by(desc(MsgLog.id)).limit(40)
         res = await session.execute(stmt)
         rows = res.all()
-        if not rows: return await m.answer("Логи пусты.")
         
-        text = "🔍 <b>Последние 10 событий:</b>\n\n"
+        filter_names = {
+            "all": "Все события",
+            "sd": "🔥 Исчезающие",
+            "deleted": "🗑 Удалённые",
+            "edited": "✏️ Отредактированные",
+            "media": "📷 Медиафайлы"
+        }
+        
+        seen_events = set()
+        unique_events = []
+        
         for msg, owner_un, owner_nm in rows:
+            content_key = (msg.text or "").strip()
+            if not content_key:
+                content_key = f"media_{msg.media_type}_{msg.telegram_file_id or msg.file_path or ''}"
+            time_bucket = int(msg.created_at.timestamp() // 10)
+            dedup_key = (msg.from_id, content_key, time_bucket)
+            
+            if dedup_key in seen_events:
+                continue
+            seen_events.add(dedup_key)
+            unique_events.append((msg, owner_un, owner_nm))
+            if len(unique_events) >= 10:
+                break
+                
+        filters_row = [
+            InlineKeyboardButton(text=f"{'• ' if filter_type == 'all' else ''}Все", callback_data="logs_f:all"),
+            InlineKeyboardButton(text=f"{'• ' if filter_type == 'sd' else ''}🔥 SD", callback_data="logs_f:sd"),
+            InlineKeyboardButton(text=f"{'• ' if filter_type == 'deleted' else ''}🗑 Удал.", callback_data="logs_f:deleted"),
+            InlineKeyboardButton(text=f"{'• ' if filter_type == 'edited' else ''}✏️ Правки", callback_data="logs_f:edited"),
+            InlineKeyboardButton(text=f"{'• ' if filter_type == 'media' else ''}📷 Медиа", callback_data="logs_f:media"),
+        ]
+        
+        kb = InlineKeyboardMarkup(inline_keyboard=[filters_row])
+        
+        if not unique_events:
+            text = f"🔍 <b>События ({filter_names.get(filter_type, filter_type)}):</b>\n\n<i>Записей не найдено.</i>"
+            kb.inline_keyboard.append([
+                InlineKeyboardButton(text="🔄 Обновить", callback_data=f"logs_f:{filter_type}"),
+                InlineKeyboardButton(text="⬅️ В меню", callback_data="back_to_main")
+            ])
+            if edit:
+                try:
+                    return await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
+                except Exception:
+                    return
+            else:
+                return await target.answer(text, reply_markup=kb, parse_mode="HTML")
+                
+        text = f"🔍 <b>События ({filter_names.get(filter_type, filter_type)}):</b>\n\n"
+        
+        seen_chats = {}
+        for idx, (msg, owner_un, owner_nm) in enumerate(unique_events, 1):
             time_str = (msg.created_at + timedelta(hours=3)).strftime("%H:%M")
             owner_info = fmt_user_info(owner_nm, owner_un, msg.owner_id)
             sender_info = fmt_user_info(msg.from_name, msg.from_username, msg.from_id)
-            text += f"🕒 <code>{time_str}</code> | Аккаунт: {owner_info}\n👤 <b>{sender_info}</b> (ID:<code>#{msg.message_id}</code>): {html.escape(msg.text[:40] if msg.text else '[Медиа]')}\n\n"
-        await m.answer(text, parse_mode="HTML")
+            is_out = (msg.from_id == msg.owner_id)
+            arrow = "📤 Исходящее" if is_out else "📥 Входящее"
+            
+            sd_tag = "🔥 [SD] " if msg.is_self_destruct else ""
+            del_tag = "🗑 [УДАЛЕНО] " if getattr(msg, 'is_deleted', False) else ""
+            edit_tag = "✏️ [ИЗМЕНЕНО] " if getattr(msg, 'is_edited', False) else ""
+            
+            raw_text = msg.text or f"[{msg.media_type or 'Медиа'}]"
+            snippet = html.escape((raw_text[:50] + "...") if len(raw_text) > 50 else raw_text)
+            
+            text += (
+                f"<b>{idx}.</b> 🕒 <code>{time_str}</code> | {owner_info}\n"
+                f"   {arrow} от <b>{sender_info}</b> (ID:<code>#{msg.message_id}</code>):\n"
+                f"   └ {del_tag}{edit_tag}{sd_tag}<i>{snippet}</i>\n\n"
+            )
+            
+            # Сохраняем уникальный диалог и имя собеседника
+            chat_key = (msg.owner_id, msg.chat_id)
+            if chat_key not in seen_chats or seen_chats[chat_key].startswith("ID:"):
+                if msg.from_id != msg.owner_id:
+                    inter_label = f"@{msg.from_username}" if msg.from_username else (msg.from_name or f"ID:{msg.chat_id}")
+                    seen_chats[chat_key] = inter_label
+                elif chat_key not in seen_chats:
+                    seen_chats[chat_key] = f"ID:{msg.chat_id}"
+
+        # Формируем кнопки перехода к диалогам без дубликатов
+        if len(seen_chats) == 1:
+            (owner_id, chat_id), inter_label = list(seen_chats.items())[0]
+            kb.inline_keyboard.append([
+                InlineKeyboardButton(text=f"💬 Открыть этот диалог ({inter_label})", callback_data=f"msgs:{owner_id}:{chat_id}:0")
+            ])
+        elif len(seen_chats) > 1:
+            chat_btns = []
+            for (owner_id, chat_id), inter_label in seen_chats.items():
+                btn_title = f"💬 Диалог с {inter_label[:15]}"
+                chat_btns.append(InlineKeyboardButton(text=btn_title, callback_data=f"msgs:{owner_id}:{chat_id}:0"))
+            
+            for i in range(0, len(chat_btns), 2):
+                kb.inline_keyboard.append(chat_btns[i:i+2])
+            
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(text="🔄 Обновить", callback_data=f"logs_f:{filter_type}"),
+            InlineKeyboardButton(text="⬅️ В главное меню", callback_data="back_to_main")
+        ])
+        
+        if edit:
+            try:
+                await target.edit_text(text[:4000], reply_markup=kb, parse_mode="HTML")
+            except Exception:
+                pass
+        else:
+            await target.answer(text[:4000], reply_markup=kb, parse_mode="HTML")
+
+@router.message(F.text.contains("логов"), F.from_user.id == ADMIN_ID)
+async def list_global_logs(m: types.Message):
+    await render_global_logs(m, "all", edit=False)
+
+@router.callback_query(F.data.startswith("logs_f:"), F.from_user.id == ADMIN_ID)
+async def filter_global_logs_cb(call: CallbackQuery):
+    await call.answer()
+    filter_type = call.data.split(":")[1]
+    await render_global_logs(call.message, filter_type, edit=True)
+
+MEDIA_PAGE_SIZE = 8
 
 @router.callback_query(F.data.startswith("media:"), F.from_user.id == ADMIN_ID)
 async def view_chat_media(call: CallbackQuery):
-    await call.answer(); _, owner_id, chat_id = call.data.split(":")
-    async with Session() as session:
-        res = await session.execute(select(MsgLog).where(MsgLog.owner_id == int(owner_id), MsgLog.chat_id == int(chat_id), MsgLog.file_path != None).order_by(desc(MsgLog.id)).limit(10))
-        media = res.scalars().all()
-        
-        seen_paths = set()
-        unique_media = []
-        for m in media:
-            if m.file_path not in seen_paths:
-                seen_paths.add(m.file_path)
-                unique_media.append(m)
+    await call.answer()
+    parts = call.data.split(":")
+    owner_id = int(parts[1])
+    chat_id = int(parts[2])
+    page = int(parts[3]) if len(parts) > 3 else 0
+    m_filter = parts[4] if len(parts) > 4 else "all"
 
-        if not unique_media: return await call.message.answer("Медиа нет.")
+    async with Session() as session:
+        inter_info = await get_interlocutor_info(session, owner_id, chat_id)
         
-        await call.message.answer("🖼 <b>Последние медиа:</b>", parse_mode="HTML")
-        for m in unique_media:
-            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📥 Скачать", callback_data=f"get_f:{m.id}")]])
-            time_str = (m.created_at + timedelta(hours=3)).strftime("%H:%M")
-            sd_mark = "🔥 [ИСЧЕЗАЮЩЕЕ] " if m.is_self_destruct else ""
-            await call.message.answer(f"{sd_mark}🕒 {time_str} | {m.media_type} (ID:<code>#{m.message_id}</code>)", reply_markup=kb, parse_mode="HTML")
+        stmt = select(MsgLog).where(
+            MsgLog.owner_id == owner_id,
+            MsgLog.chat_id == chat_id,
+            or_(MsgLog.file_path != None, MsgLog.telegram_file_id != None)
+        )
+        if m_filter == "sd":
+            stmt = stmt.where(MsgLog.is_self_destruct == True)
+        elif m_filter == "deleted":
+            stmt = stmt.where(MsgLog.is_deleted == True)
+        elif m_filter == "photo":
+            stmt = stmt.where(MsgLog.media_type == "photo")
+        elif m_filter == "video":
+            stmt = stmt.where(or_(MsgLog.media_type == "video", MsgLog.media_type == "video_note"))
+        elif m_filter == "voice":
+            stmt = stmt.where(or_(MsgLog.media_type == "voice", MsgLog.media_type == "audio"))
+        elif m_filter == "doc":
+            stmt = stmt.where(MsgLog.media_type == "document")
+            
+        total_res = await session.execute(select(func.count()).select_from(stmt.subquery()))
+        total_count = total_res.scalar() or 0
+        
+        max_pages = max(1, (total_count + MEDIA_PAGE_SIZE - 1) // MEDIA_PAGE_SIZE)
+        if page >= max_pages:
+            page = max(0, max_pages - 1)
+
+        res = await session.execute(stmt.order_by(desc(MsgLog.id)).limit(MEDIA_PAGE_SIZE).offset(page * MEDIA_PAGE_SIZE))
+        media_items = res.scalars().all()
+
+        filter_names = {
+            "all": "Все файлы",
+            "sd": "🔥 Исчезающие",
+            "deleted": "🗑 Удалённые",
+            "photo": "📷 Фото",
+            "video": "🎥 Видео",
+            "voice": "🎙 Голос",
+            "doc": "📄 Документы"
+        }
+        
+        filter_row1 = [
+            InlineKeyboardButton(text=f"{'• ' if m_filter == 'all' else ''}Все", callback_data=f"media:{owner_id}:{chat_id}:0:all"),
+            InlineKeyboardButton(text=f"{'• ' if m_filter == 'sd' else ''}🔥 SD", callback_data=f"media:{owner_id}:{chat_id}:0:sd"),
+            InlineKeyboardButton(text=f"{'• ' if m_filter == 'deleted' else ''}🗑 Удал.", callback_data=f"media:{owner_id}:{chat_id}:0:deleted"),
+        ]
+        filter_row2 = [
+            InlineKeyboardButton(text=f"{'• ' if m_filter == 'photo' else ''}📷 Фото", callback_data=f"media:{owner_id}:{chat_id}:0:photo"),
+            InlineKeyboardButton(text=f"{'• ' if m_filter == 'video' else ''}🎥 Видео", callback_data=f"media:{owner_id}:{chat_id}:0:video"),
+            InlineKeyboardButton(text=f"{'• ' if m_filter == 'voice' else ''}🎙 Голос", callback_data=f"media:{owner_id}:{chat_id}:0:voice"),
+        ]
+        
+        kb = InlineKeyboardMarkup(inline_keyboard=[filter_row1, filter_row2])
+        
+        for m in media_items:
+            time_str = (m.created_at + timedelta(hours=3)).strftime("%d.%m %H:%M")
+            sd_mark = "🔥 " if m.is_self_destruct else ""
+            del_mark = "🗑 " if getattr(m, 'is_deleted', False) else ""
+            type_icon = {"photo": "📷", "video": "🎥", "video_note": "⭕", "voice": "🎙", "audio": "🎵", "document": "📄"}.get(m.media_type, "📎")
+            btn_title = f"{del_mark}{sd_mark}{type_icon} #{m.message_id} ({time_str})"
+            kb.inline_keyboard.append([InlineKeyboardButton(text=btn_title, callback_data=f"get_f:{m.id}")])
+
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton(text="⬅️", callback_data=f"media:{owner_id}:{chat_id}:{page-1}:{m_filter}"))
+        nav_row.append(InlineKeyboardButton(text=f"{page+1}/{max_pages}", callback_data="noop"))
+        if page + 1 < max_pages:
+            nav_row.append(InlineKeyboardButton(text="➡️", callback_data=f"media:{owner_id}:{chat_id}:{page+1}:{m_filter}"))
+        
+        kb.inline_keyboard.append(nav_row)
+        kb.inline_keyboard.append([InlineKeyboardButton(text="⬅️ Назад к чату", callback_data=f"chat:{owner_id}:{chat_id}")])
+
+        text = (
+            f"🖼 <b>Медиа чата:</b> {inter_info}\n"
+            f"Всего файлов: <code>{total_count}</code> | Фильтр: <b>{filter_names.get(m_filter, m_filter)}</b>\n\n"
+            f"<i>Нажмите на файл в списке ниже, чтобы бот прислал его:</i>"
+        )
+        if not media_items:
+            text += "\n\n<i>Медиафайлов не найдено.</i>"
+
+        try:
+            await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+@router.callback_query(F.data == "noop")
+async def noop_cb(call: CallbackQuery):
+    await call.answer()
 
 @router.callback_query(F.data.startswith("get_f:"), F.from_user.id == ADMIN_ID)
 async def send_file(call: CallbackQuery, bot: Bot):
-    await call.answer("Отправка...")
+    await call.answer("Отправка файла...")
     log_id = int(call.data.split(":")[1])
     async with Session() as session:
         res = await session.execute(select(MsgLog).where(MsgLog.id == log_id))
         log = res.scalars().first()
-        if log and log.file_path and os.path.exists(log.file_path):
-            f = FSInputFile(log.file_path)
-            try:
-                if log.media_type == "photo": await bot.send_photo(ADMIN_ID, f)
-                elif log.media_type == "voice": await bot.send_voice(ADMIN_ID, f)
-                elif log.media_type == "video": await bot.send_video(ADMIN_ID, f)
-                elif log.media_type == "video_note": await bot.send_video_note(ADMIN_ID, f)
-                else: await bot.send_document(ADMIN_ID, f)
-            except: pass
+        if not log:
+            return await call.message.answer("❌ Запись не найдена в базе.")
+        
+        target = None
+        if log.file_path and os.path.exists(log.file_path):
+            target = FSInputFile(log.file_path)
+        elif log.telegram_file_id:
+            target = log.telegram_file_id
+        
+        if not target:
+            return await call.message.answer("❌ Файл не найден на сервере и нет file_id.")
+            
+        try:
+            time_str = (log.created_at + timedelta(hours=3)).strftime("%d.%m.%Y %H:%M")
+            sd_mark = "🔥 [ИСЧЕЗАЮЩЕЕ МЕДИА] " if log.is_self_destruct else ""
+            caption = f"{sd_mark}🕒 {time_str} | ID: <code>#{log.message_id}</code>"
+            if log.media_type == "photo": await bot.send_photo(ADMIN_ID, target, caption=caption, parse_mode="HTML")
+            elif log.media_type == "voice": await bot.send_voice(ADMIN_ID, target, caption=caption, parse_mode="HTML")
+            elif log.media_type == "video": await bot.send_video(ADMIN_ID, target, caption=caption, parse_mode="HTML")
+            elif log.media_type == "video_note": await bot.send_video_note(ADMIN_ID, target)
+            else: await bot.send_document(ADMIN_ID, target, caption=caption, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Error sending file {log_id}: {e}")
+            await call.message.answer(f"❌ Ошибка отправки: {e}")
 
 @router.callback_query(F.data == "back_to_settings", F.from_user.id == ADMIN_ID)
 async def back_to_settings(call: CallbackQuery):

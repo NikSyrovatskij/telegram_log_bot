@@ -1,4 +1,7 @@
 import asyncio, logging, os, csv
+from dotenv import load_dotenv
+load_dotenv()
+
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher
 from aiogram.types import FSInputFile
@@ -6,13 +9,10 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from database.engine import init_db, Session
 from database.models import MsgLog, Conn, UserAccount, PaymentRecord
 from handlers import admin, business
-from dotenv import load_dotenv
 from sqlalchemy import select, desc
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from yookassa import Configuration, Payment
 import zipfile
-
-load_dotenv()
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=os.getenv("BOT_TOKEN"))
 
@@ -157,16 +157,7 @@ async def main():
     
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
     scheduler.add_job(send_daily_exports, 'cron', hour=3, minute=0)
-    check_interval = int(os.getenv("PAYMENT_CHECK_INTERVAL", 30))
-    scheduler.add_job(check_pending_payments, 'interval', seconds=check_interval)
-    scheduler.start()
-    
-    scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
-    scheduler.add_job(send_daily_exports, 'cron', hour=3, minute=0)
-    
-    # НОВАЯ СТРОКА: Авто-архив каждый понедельник (day_of_week='mon') в 03:30
     scheduler.add_job(auto_archive_media_job, 'cron', day_of_week='mon', hour=3, minute=30)
-    
     check_interval = int(os.getenv("PAYMENT_CHECK_INTERVAL", 30))
     scheduler.add_job(check_pending_payments, 'interval', seconds=check_interval)
     scheduler.start()
